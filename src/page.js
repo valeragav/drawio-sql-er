@@ -8,6 +8,7 @@
 const { toGraphModelXml, sideStyle } = require('./drawio');
 const { routeLinks } = require('./routing');
 const { placeNewTables } = require('./placement');
+const { selectTables } = require('./select');
 
 const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
 
@@ -115,8 +116,10 @@ function reroute(ui) {
 //   - новые таблицы ставятся рядом со связанными;
 //   - таблицы, которых нет в схеме, помечаются (пунктир, полупрозрачно), а не удаляются;
 //   - связи пересобираются и перепрокладываются.
+// selected — отмеченные в окне таблицы: какие новые добавить. Таблицы, уже стоящие
+// на странице, обновляются всегда; неотмеченные таблицы схемы удалёнными не считаются.
 // Всё — одна операция (один Ctrl+Z). Возвращает сводку или { error }.
-function updatePage(ui, schema, opts) {
+function updatePage(ui, fullSchema, opts, selected) {
   const graph = ui.editor.graph;
   const layer = graph.getDefaultParent();
   const { model, isTable, nameOf, linksOf, geo } = helpers(graph);
@@ -128,6 +131,11 @@ function updatePage(ui, schema, opts) {
   if (!pageTables.size) {
     return { error: 'На странице нет таблиц, вставленных плагином, — используйте «Вставить».' };
   }
+
+  const inSchema = new Set(fullSchema.tables.map(t => t.name));
+  const wanted = new Set(selected || inSchema);
+  for (const name of pageTables.keys()) if (inSchema.has(name)) wanted.add(name);
+  const schema = selectTables(fullSchema, [...wanted]);
 
   // Свежая диаграмма по новой схеме — из неё берём строки, размеры и связи.
   const doc = mxUtils.parseXml(toGraphModelXml(schema, opts));

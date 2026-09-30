@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 
 const root = path.join(__dirname, '..');
-const modules = ['parser', 'routing', 'placement', 'drawio', 'page', 'plugin'];
+const modules = ['parser', 'routing', 'placement', 'select', 'drawio', 'page', 'plugin'];
 const entry = 'plugin';
 
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));

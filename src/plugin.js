@@ -8,6 +8,7 @@
 const { parseSql } = require('./parser');
 const { toGraphModelXml } = require('./drawio');
 const { reroute, updatePage } = require('./page');
+const { selectTables, withRelated } = require('./select');
 
 const ACTION = 'sqlErImport';
 const REROUTE = 'sqlErReroute';
@@ -220,16 +221,27 @@ function showDialog(ui) {
   textarea.setAttribute('spellcheck', 'false');
   textarea.setAttribute('wrap', 'off');
   textarea.style.cssText =
-    'flex:1;min-height:0;width:100%;box-sizing:border-box;resize:none;' +
+    'flex:1;min-width:0;min-height:0;box-sizing:border-box;resize:none;' +
     'font-family:Consolas,Menlo,monospace;font-size:12px;padding:6px;';
-  div.appendChild(textarea);
+
+  // Поле SQL слева, список таблиц справа.
+  const workArea = el('div', 'flex:1;min-height:0;display:flex;gap:8px;');
+  workArea.appendChild(textarea);
+  const picker = tablePicker();
+  workArea.appendChild(picker.node);
+  div.appendChild(workArea);
 
   const status = el('div', 'min-height:16px;font-size:12px;opacity:0.8;white-space:pre-wrap;max-height:60px;overflow:auto;');
   div.appendChild(status);
 
   const updateStatus = () => {
-    if (!textarea.value.trim()) { status.textContent = ''; return; }
+    if (!textarea.value.trim()) {
+      status.textContent = '';
+      picker.setSchema(null);
+      return;
+    }
     const model = parseSql(textarea.value);
+    picker.setSchema(model);
     const indexes = model.tables.reduce((n, t) => n + t.indexes.length, 0);
     let text = `Таблиц: ${model.tables.length}, связей: ${model.relations.length}, индексов: ${indexes}`;
     if (model.warnings.length) text += '\n⚠ ' + model.warnings.join('\n⚠ ');
@@ -327,6 +339,7 @@ function showDialog(ui) {
     if (model.warnings.length && typeof console !== 'undefined') {
       console.warn('[sql-er] ' + model.warnings.join('\n[sql-er] '));
     }
+    picker.setSchema(model); // на случай, если «Вставить» нажали раньше, чем обновился список
     return model;
   };
   const renderOptions = () => ({
@@ -338,7 +351,12 @@ function showDialog(ui) {
   const insertBtn = mxUtils.button('Вставить', () => {
     const model = parsed();
     if (!model) return;
-    insertXml(ui, toGraphModelXml(model, renderOptions()), replaceBox.checked);
+    const selected = picker.selected();
+    if (!selected.length) {
+      status.textContent = 'Не отмечено ни одной таблицы';
+      return;
+    }
+    insertXml(ui, toGraphModelXml(selectTables(model, selected), renderOptions()), replaceBox.checked);
     ui.hideDialog();
   });
   insertBtn.className = 'geBtn gePrimaryBtn';
@@ -347,7 +365,8 @@ function showDialog(ui) {
   const updateBtn = mxUtils.button('Обновить на странице', () => {
     const model = parsed();
     if (!model) return;
-    const res = updatePage(ui, model, renderOptions());
+    // Таблицы на странице обновляются всегда; отметки решают, какие новые добавить.
+    const res = updatePage(ui, model, renderOptions(), picker.selected());
     if (res.error) {
       status.textContent = '✖ ' + res.error;
       return;
@@ -368,8 +387,103 @@ function showDialog(ui) {
   buttons.appendChild(insertBtn);
   div.appendChild(buttons);
 
-  ui.showDialog(div, 720, 540, true, true);
+  ui.showDialog(div, 900, 560, true, true);
   (radios.db.checked ? urlInput : textarea).focus();
+}
+
+// ------------------------------------------------------------ список таблиц
+//
+// Галочки у таблиц схемы, поиск по имени, «Все» / «Ни одной» (для видимых по поиску)
+// и «+ связанные». Отметки хранятся по имени и переживают правку SQL; новые таблицы
+// появляются отмеченными.
+
+function tablePicker() {
+  const node = el('div', 'width:230px;flex:none;display:flex;flex-direction:column;gap:4px;min-height:0;');
+  const search = document.createElement('input');
+  search.type = 'search';
+  search.placeholder = 'поиск таблицы';
+  search.style.cssText = 'box-sizing:border-box;width:100%;padding:3px 4px;font-size:12px;';
+  node.appendChild(search);
+
+  const tools = el('div', 'display:flex;gap:4px;flex-wrap:wrap;');
+  const smallButton = (text, title, fn) => {
+    const b = mxUtils.button(text, fn);
+    b.className = 'geBtn';
+    b.title = title;
+    b.style.cssText = 'margin:0;padding:0 6px;min-width:0;height:22px;font-size:11px;';
+    tools.appendChild(b);
+  };
+  node.appendChild(tools);
+
+  const list = el('div', 'flex:1;min-height:0;overflow:auto;border:1px solid rgba(128,128,128,0.4);padding:2px 4px;font-size:12px;');
+  node.appendChild(list);
+  const counter = el('div', 'font-size:11px;opacity:0.8;');
+  node.appendChild(counter);
+
+  const checked = new Map(); // имя → отмечена ли
+  let schema = null;
+
+  const visible = () => {
+    const q = search.value.trim().toLowerCase();
+    return schema ? schema.tables.map(t => t.name).filter(n => !q || n.toLowerCase().includes(q)) : [];
+  };
+
+  function render() {
+    list.textContent = '';
+    const names = visible();
+    for (const name of names) {
+      const label = el('label', 'display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;');
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = checked.get(name);
+      box.addEventListener('change', () => {
+        checked.set(name, box.checked);
+        updateCounter();
+      });
+      label.appendChild(box);
+      label.appendChild(document.createTextNode(name));
+      label.title = name;
+      list.appendChild(label);
+    }
+    if (schema && !names.length) list.appendChild(el('div', 'opacity:0.6;', 'ничего не найдено'));
+    if (!schema) list.appendChild(el('div', 'opacity:0.6;', 'здесь появятся таблицы из SQL'));
+    updateCounter();
+  }
+
+  function updateCounter() {
+    const total = schema ? schema.tables.length : 0;
+    counter.textContent = total ? `выбрано ${selected().length} из ${total}` : '';
+  }
+
+  function selected() {
+    return schema ? schema.tables.map(t => t.name).filter(n => checked.get(n)) : [];
+  }
+
+  smallButton('Все', 'Отметить все (видимые по поиску)', () => {
+    visible().forEach(n => checked.set(n, true));
+    render();
+  });
+  smallButton('Ни одной', 'Снять отметки (с видимых по поиску)', () => {
+    visible().forEach(n => checked.set(n, false));
+    render();
+  });
+  smallButton('+ связанные', 'Добавить таблицы, связанные с отмеченными', () => {
+    if (!schema) return;
+    withRelated(schema, selected()).forEach(n => checked.set(n, true));
+    render();
+  });
+  search.addEventListener('input', render);
+
+  render();
+  return {
+    node,
+    selected,
+    setSchema(next) {
+      schema = next && next.tables.length ? next : null;
+      if (schema) for (const t of schema.tables) if (!checked.has(t.name)) checked.set(t.name, true);
+      render();
+    }
+  };
 }
 
 function checkbox(parent, text, checked) {
