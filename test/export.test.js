@@ -23,8 +23,13 @@ function cellsFromXml(xml) {
     const m = /<mxGeometry x="([\d.-]+)" y="([\d.-]+)"/.exec(body);
     return m ? +m[2] : 0;
   };
-  for (const m of xml.matchAll(/<UserObject label="([^"]*)" tooltip="([^"]*)" id="([^"]+)"><mxCell style="([^"]*)" vertex="1" parent="([^"]+)">(.*?)<\/mxCell><\/UserObject>/g)) {
-    cells.push({ id: m[3], value: unescape(unescape(m[1])), tooltip: unescape(m[2]), style: unescape(m[4]), parent: m[5], vertex: true, y: geo(m[6]) });
+  for (const m of xml.matchAll(/<UserObject ([^>]*)><mxCell style="([^"]*)" vertex="1" parent="([^"]+)">(.*?)<\/mxCell><\/UserObject>/g)) {
+    const a = Object.fromEntries([...m[1].matchAll(/(\w+)="([^"]*)"/g)].map(x => [x[1], x[2]]));
+    cells.push({
+      id: a.id, value: unescape(unescape(a.label || '')), tooltip: a.tooltip ? unescape(a.tooltip) : null,
+      hidden: a.sqlErHidden ? unescape(a.sqlErHidden) : null,
+      style: unescape(m[2]), parent: m[3], vertex: true, y: geo(m[4])
+    });
   }
   for (const m of xml.matchAll(/<mxCell id="([^"]+)"(?: value="([^"]*)")? style="([^"]*)" (vertex|edge)="1" parent="([^"]+)"(?: source="([^"]+)" target="([^"]+)")?>(.*?)<\/mxCell>/g)) {
     cells.push({
@@ -130,4 +135,30 @@ test('переименованная на диаграмме таблица: с�
   assert.deepEqual(again.warnings, []);
   assert.deepEqual(again.relations.map(r => `${r.parent}→${r.child}.${r.childColumn}`).sort(),
     ['app_users→orders.buyer', 'app_users→orders.user_id']);
+});
+
+test('компактный режим: видны ключи и колонки со связями, остальное — «⋯ ещё N колонок»', () => {
+  const original = parseSql(read('ecommerce.sql'));
+  const xml = toGraphModelXml(original, { compact: true });
+  const cells = cellsFromXml(xml);
+  const users = cells.find(c => c.value === 'users');
+  const rows = cells.filter(c => c.parent === users.id).sort((a, b) => a.y - b.y).map(c => c.value);
+  // у users: id (PK, на него ссылаются) видна, остальные 8 колонок свёрнуты
+  assert.deepEqual(rows, ['🔑 id : BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY', '⋯ ещё 8 колонок']);
+  const hiddenRow = cells.find(c => c.parent === users.id && c.hidden);
+  assert.match(hiddenRow.tooltip, /^email : TEXT NOT NULL UNIQUE\npassword_hash/);
+  // у orders видны FK и колонки-ссылки
+  const orders = cells.find(c => c.value === 'orders');
+  const orderRows = cells.filter(c => c.parent === orders.id && !c.hidden && /:/.test(c.value)).map(c => c.value.split(' : ')[0]);
+  // status — колонка типа ENUM (к ней идёт линия от блока ENUM)
+  assert.deepEqual(orderRows, ['🔑 id', 'user_id', 'status', 'coupon_id', 'shipping_address_id']);
+});
+
+test('компактный режим не мешает экспорту и сравнению: таблицы читаются целиком', () => {
+  for (const example of ['ecommerce.sql', 'features.sql']) {
+    const original = parseSql(read(example));
+    const { sql, warnings } = exportSql(cellsFromXml(toGraphModelXml(original, { compact: true })));
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(essence(parseSql(sql)), essence(original), example);
+  }
 });

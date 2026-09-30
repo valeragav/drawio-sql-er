@@ -360,6 +360,8 @@ function showDialog(ui) {
   const enumsBox = checkbox(options, 'ENUM', true);
   const viewsBox = checkbox(options, 'Представления', true);
   const commentsBox = checkbox(options, 'Комментарии', true);
+  const compactBox = checkbox(options, 'Компактно', false);
+  compactBox.parentNode.title = 'Только ключи и колонки со связями; остальные — строкой «⋯ ещё N колонок» (список — в подсказке)';
 
   // Рамки групп: по схемам (billing.*) или по префиксам имён (course_*, article_*).
   const groupLabel = el('label', 'display:flex;align-items:center;gap:4px;');
@@ -410,6 +412,7 @@ function showDialog(ui) {
     showViews: viewsBox.checked,
     showComments: commentsBox.checked,
     groupBy: groupSelect.value,
+    compact: compactBox.checked,
     measureText
   });
 

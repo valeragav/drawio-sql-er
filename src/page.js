@@ -336,6 +336,7 @@ function pageCells(ui) {
       style: model.getStyle(c) || '',
       value: text(c),
       tooltip: c.value && c.value.getAttribute ? c.value.getAttribute('tooltip') : null,
+      hidden: c.value && c.value.getAttribute ? c.value.getAttribute('sqlErHidden') : null,
       y: g ? g.y : 0,
       source: source ? source.id : null,
       target: target ? target.id : null
@@ -394,7 +395,12 @@ function markDiff(ui, diff) {
     mark(table, DIFF_RED, 2);
     const columns = new Set(t.changes.map(c => c.column).filter(Boolean));
     for (const row of model.getChildren(table) || []) {
-      if (model.isVertex(row) && columns.has(parseColumnText(text(row)).name)) mark(row, DIFF_RED, 2);
+      if (!model.isVertex(row)) continue;
+      const hidden = row.value && row.value.getAttribute ? row.value.getAttribute('sqlErHidden') : null;
+      const names = hidden
+        ? JSON.parse(hidden).map(h => parseColumnText(String(h.label || '')).name)
+        : [parseColumnText(text(row)).name];
+      if (names.some(n => columns.has(n))) mark(row, DIFF_RED, 2);
     }
   }
   for (const item of diff.enums.concat(diff.views)) {

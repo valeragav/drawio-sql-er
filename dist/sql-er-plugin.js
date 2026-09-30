@@ -1760,6 +1760,8 @@ const ROW_STYLE =
 
 const NOTE_STYLE = ROW_STYLE + 'fontSize=11;textOpacity=60;';
 const COMMENT_STYLE = NOTE_STYLE + 'fontStyle=2;';
+// Строка «⋯ ещё N колонок» компактного режима; сами колонки — в атрибуте sqlErHidden.
+const HIDDEN_STYLE = NOTE_STYLE + 'sqlErHidden=1;';
 
 const VIEW_STYLE = TABLE_STYLE + 'dashed=1;dashPattern=8 4;';
 const ENUM_STYLE = TABLE_STYLE.replace('fontStyle=1;', 'fontStyle=3;') + 'rounded=1;arcSize=6;';
@@ -1779,6 +1781,7 @@ const DEFAULTS = {
   showViews: true,
   showComments: true,
   groupBy: 'none', // 'none' | 'schema' | 'prefix'
+  compact: false, // только ключи и колонки со связями, остальное — «⋯ ещё N колонок»
   detail: 'sql',
   x: 0,
   y: 0
@@ -1825,22 +1828,27 @@ function indexLabel(index) {
 
 // Строки таблицы: колонки, затем (через разделитель) составные UNIQUE и индексы.
 // y — смещение строки от верха таблицы.
-function buildRows(table, opts) {
+// keep — в компактном режиме: колонки, которые остаются видимыми (ключи и колонки со связями).
+function buildRows(table, opts, keep) {
   const rows = [];
   // COMMENT ON TABLE — мелкой строкой сразу под заголовком.
   if (opts.showComments && table.comment) rows.push(commentRow(table.comment));
 
-  for (const col of table.columns) {
+  const hidden = [];
+  table.columns.forEach((col, index) => {
     // COMMENT ON COLUMN — всплывающей подсказкой; значок 💬 показывает, что она есть.
     const comment = opts.showComments && col.comment ? col.comment : null;
-    rows.push({
+    const row = {
       column: col.name,
       label: columnLabel(col, opts) + (comment ? ' 💬' : ''),
       tooltip: comment,
       style: ROW_STYLE + (fontStyle(col) ? 'fontStyle=' + fontStyle(col) + ';' : ''),
       height: ROW_HEIGHT
-    });
-  }
+    };
+    if (keep && !keep.has(col.name)) hidden.push(Object.assign(row, { index }));
+    else rows.push(row);
+  });
+  if (hidden.length) rows.push(hiddenRow(hidden));
 
   const notes = opts.detail === 'tags'
     ? (table.compositeUniques || []).map(cols => 'UNIQUE (' + cols.join(', ') + ')')
@@ -1851,6 +1859,23 @@ function buildRows(table, opts) {
     notes.forEach(label => rows.push({ column: null, label, style: NOTE_STYLE, height: NOTE_HEIGHT, note: true }));
   }
   return rows;
+}
+
+// «⋯ ещё 5 колонок»: подсказка — их список, атрибут sqlErHidden — сами строки (для экспорта
+// и сравнения со схемой, чтобы таблица читалась целиком).
+function hiddenRow(hidden) {
+  const n = hidden.length;
+  const word = n % 10 === 1 && n % 100 !== 11 ? 'колонка'
+    : n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? 'колонки' : 'колонок';
+  return {
+    column: null,
+    label: `⋯ ещё ${n} ${word}`,
+    tooltip: hidden.map(r => r.label.replace(/ 💬$/, '')).join('\n'),
+    attrs: { sqlErHidden: JSON.stringify(hidden.map(r => ({ index: r.index, label: r.label, style: r.style, tooltip: r.tooltip || null }))) },
+    style: HIDDEN_STYLE,
+    height: NOTE_HEIGHT,
+    note: true
+  };
 }
 
 function commentRow(text) {
@@ -1875,6 +1900,20 @@ function enumRows(en, opts) {
 const enumKey = name => 'enum:' + name;
 
 function schemaGraph(model, opts) {
+  // Компактный режим: видимыми остаются PK, FK, колонки, на которые ссылаются, и колонки-ENUM.
+  const linked = new Set();
+  if (opts.compact) {
+    for (const r of model.relations) {
+      [[r.parent, r.parentColumn], [r.child, r.childColumn]]
+        .concat((r.extraColumns || []).flatMap(p => [[r.parent, p.parentColumn], [r.child, p.childColumn]]))
+        .forEach(([t, c]) => linked.add(t + '\u0000' + c));
+    }
+    for (const l of model.enumLinks || []) linked.add(l.table + '\u0000' + l.column);
+  }
+  const keepFor = t => (opts.compact && (t.kind || 'table') === 'table'
+    ? new Set(t.columns.filter(c => c.primaryKey || c.foreignKey || linked.has(t.name + '\u0000' + c.name)).map(c => c.name))
+    : null);
+
   const nodes = [];
   for (const t of model.tables) {
     const kind = t.kind || 'table';
@@ -1884,7 +1923,7 @@ function schemaGraph(model, opts) {
       kind,
       title: kind === 'table' ? t.name : `${t.name} (${kind})`,
       table: t,
-      rows: buildRows(t, opts)
+      rows: buildRows(t, opts, keepFor(t))
     });
   }
   if (opts.showEnums) {
@@ -2166,12 +2205,13 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function vertex(id, parent, value, style, x, y, w, h, tooltip) {
+function vertex(id, parent, value, style, x, y, w, h, tooltip, attrs) {
   const geometry = `<mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry"/>`;
   const label = escapeXml(escapeHtml(value));
-  if (tooltip) {
-    // Подсказка при наведении — атрибут tooltip у UserObject (так её хранит draw.io).
-    return `<UserObject label="${label}" tooltip="${escapeXml(tooltip)}" id="${id}">` +
+  if (tooltip || attrs) {
+    // Подсказка при наведении и другие данные — атрибуты UserObject (так их хранит draw.io).
+    const extra = Object.entries(attrs || {}).map(([k, v]) => ` ${k}="${escapeXml(v)}"`).join('');
+    return `<UserObject label="${label}"${tooltip ? ` tooltip="${escapeXml(tooltip)}"` : ''}${extra} id="${id}">` +
       `<mxCell style="${escapeXml(style)}" vertex="1" parent="${parent}">${geometry}</mxCell></UserObject>`;
   }
   return `<mxCell id="${id}" value="${label}" style="${escapeXml(style)}" vertex="1" parent="${parent}">${geometry}</mxCell>`;
@@ -2240,7 +2280,7 @@ function toGraphModelXml(model, options) {
     box.rows.forEach((row, i) => {
       const rowId = tableId + '-r' + i;
       if (row.column) rowIds.set(node.name + '\u0000' + row.column, rowId);
-      cells.push(vertex(rowId, tableId, row.label, row.style, 0, row.y, box.width, row.height, row.tooltip));
+      cells.push(vertex(rowId, tableId, row.label, row.style, 0, row.y, box.width, row.height, row.tooltip, row.attrs));
     });
   }
 
@@ -2306,10 +2346,29 @@ function readDiagram(cells) {
         name = m[1];
       }
     }
-    const rows = (children.get(c.id) || [])
-      .filter(r => r.vertex)
-      .sort((a, b) => a.y - b.y)
-      .map(r => ({ id: r.id, text: (r.value || '').trim(), style: r.style || '', tooltip: r.tooltip || null }));
+    const rows = [];
+    for (const r of (children.get(c.id) || []).filter(x => x.vertex).sort((a, b) => a.y - b.y)) {
+      // Компактный режим: «⋯ ещё N колонок» — разворачиваем обратно в строки колонок.
+      if (r.hidden) {
+        let list = [];
+        try { list = JSON.parse(r.hidden); } catch (e) { /* повреждено — пропускаем */ }
+        // Скрытые колонки встают на свои исходные места (index) среди видимых.
+        const head = rows.filter(x => rowKind(x) !== 'column');
+        const visible = rows.filter(x => rowKind(x) === 'column');
+        const merged = new Array(visible.length + list.length);
+        list.forEach((h, k) => {
+          const at = Number.isInteger(h.index) && h.index < merged.length && !merged[h.index] ? h.index : null;
+          const row = { id: r.id + '#' + k, text: String(h.label || '').trim(), style: h.style || '', tooltip: h.tooltip || null };
+          if (at !== null) merged[at] = row;
+          else visible.push(row);
+        });
+        for (let i = 0; i < merged.length && visible.length; i++) if (!merged[i]) merged[i] = visible.shift();
+        rows.length = 0;
+        rows.push(...head, ...merged.filter(Boolean), ...visible);
+        continue;
+      }
+      rows.push({ id: r.id, text: (r.value || '').trim(), style: r.style || '', tooltip: r.tooltip || null });
+    }
     // key — исходное имя (скрытая метка), name — текущая подпись (могли переименовать).
     const node = { id: c.id, kind, name, key: key.replace(/^enum:/, ''), rows, removed: hasFlag(c.style, 'sqlErRemoved') };
     nodes.push(node);
@@ -2337,6 +2396,7 @@ function readDiagram(cells) {
 // Вид строки таблицы по её стилю.
 function rowKind(row) {
   if (/^line;/.test(row.style)) return 'divider';
+  if (/sqlErHidden=1/.test(row.style)) return 'hidden';
   if (/textOpacity=60/.test(row.style)) return /fontStyle=2;/.test(row.style) ? 'comment' : 'note';
   return 'column';
 }
@@ -2923,6 +2983,7 @@ function pageCells(ui) {
       style: model.getStyle(c) || '',
       value: text(c),
       tooltip: c.value && c.value.getAttribute ? c.value.getAttribute('tooltip') : null,
+      hidden: c.value && c.value.getAttribute ? c.value.getAttribute('sqlErHidden') : null,
       y: g ? g.y : 0,
       source: source ? source.id : null,
       target: target ? target.id : null
@@ -2981,7 +3042,12 @@ function markDiff(ui, diff) {
     mark(table, DIFF_RED, 2);
     const columns = new Set(t.changes.map(c => c.column).filter(Boolean));
     for (const row of model.getChildren(table) || []) {
-      if (model.isVertex(row) && columns.has(parseColumnText(text(row)).name)) mark(row, DIFF_RED, 2);
+      if (!model.isVertex(row)) continue;
+      const hidden = row.value && row.value.getAttribute ? row.value.getAttribute('sqlErHidden') : null;
+      const names = hidden
+        ? JSON.parse(hidden).map(h => parseColumnText(String(h.label || '')).name)
+        : [parseColumnText(text(row)).name];
+      if (names.some(n => columns.has(n))) mark(row, DIFF_RED, 2);
     }
   }
   for (const item of diff.enums.concat(diff.views)) {
@@ -3521,6 +3587,8 @@ function showDialog(ui) {
   const enumsBox = checkbox(options, 'ENUM', true);
   const viewsBox = checkbox(options, 'Представления', true);
   const commentsBox = checkbox(options, 'Комментарии', true);
+  const compactBox = checkbox(options, 'Компактно', false);
+  compactBox.parentNode.title = 'Только ключи и колонки со связями; остальные — строкой «⋯ ещё N колонок» (список — в подсказке)';
 
   // Рамки групп: по схемам (billing.*) или по префиксам имён (course_*, article_*).
   const groupLabel = el('label', 'display:flex;align-items:center;gap:4px;');
@@ -3571,6 +3639,7 @@ function showDialog(ui) {
     showViews: viewsBox.checked,
     showComments: commentsBox.checked,
     groupBy: groupSelect.value,
+    compact: compactBox.checked,
     measureText
   });
 
@@ -3939,6 +4008,6 @@ if (typeof Draw !== 'undefined' && Draw.loadPlugin) {
 
   };
 
-  if (typeof window !== 'undefined') window.__sqlErBuild = "70fdb546a214";
+  if (typeof window !== 'undefined') window.__sqlErBuild = "56d76d5b27be";
   require("plugin");
 })();

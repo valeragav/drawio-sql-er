@@ -42,10 +42,29 @@ function readDiagram(cells) {
         name = m[1];
       }
     }
-    const rows = (children.get(c.id) || [])
-      .filter(r => r.vertex)
-      .sort((a, b) => a.y - b.y)
-      .map(r => ({ id: r.id, text: (r.value || '').trim(), style: r.style || '', tooltip: r.tooltip || null }));
+    const rows = [];
+    for (const r of (children.get(c.id) || []).filter(x => x.vertex).sort((a, b) => a.y - b.y)) {
+      // Компактный режим: «⋯ ещё N колонок» — разворачиваем обратно в строки колонок.
+      if (r.hidden) {
+        let list = [];
+        try { list = JSON.parse(r.hidden); } catch (e) { /* повреждено — пропускаем */ }
+        // Скрытые колонки встают на свои исходные места (index) среди видимых.
+        const head = rows.filter(x => rowKind(x) !== 'column');
+        const visible = rows.filter(x => rowKind(x) === 'column');
+        const merged = new Array(visible.length + list.length);
+        list.forEach((h, k) => {
+          const at = Number.isInteger(h.index) && h.index < merged.length && !merged[h.index] ? h.index : null;
+          const row = { id: r.id + '#' + k, text: String(h.label || '').trim(), style: h.style || '', tooltip: h.tooltip || null };
+          if (at !== null) merged[at] = row;
+          else visible.push(row);
+        });
+        for (let i = 0; i < merged.length && visible.length; i++) if (!merged[i]) merged[i] = visible.shift();
+        rows.length = 0;
+        rows.push(...head, ...merged.filter(Boolean), ...visible);
+        continue;
+      }
+      rows.push({ id: r.id, text: (r.value || '').trim(), style: r.style || '', tooltip: r.tooltip || null });
+    }
     // key — исходное имя (скрытая метка), name — текущая подпись (могли переименовать).
     const node = { id: c.id, kind, name, key: key.replace(/^enum:/, ''), rows, removed: hasFlag(c.style, 'sqlErRemoved') };
     nodes.push(node);
@@ -73,6 +92,7 @@ function readDiagram(cells) {
 // Вид строки таблицы по её стилю.
 function rowKind(row) {
   if (/^line;/.test(row.style)) return 'divider';
+  if (/sqlErHidden=1/.test(row.style)) return 'hidden';
   if (/textOpacity=60/.test(row.style)) return /fontStyle=2;/.test(row.style) ? 'comment' : 'note';
   return 'column';
 }
