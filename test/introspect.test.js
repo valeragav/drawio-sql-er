@@ -79,3 +79,28 @@ test('упрощение выражений, которые PostgreSQL хран�
   ];
   for (const [input, expected] of cases) assert.equal(simplifyExpr(input), expected, input);
 });
+
+test('одинаковые ограничения под разными именами показываются один раз, с предупреждением', () => {
+  const { buildDdl, duplicateConstraints } = require('../bridge/introspect');
+  const check = n => ({ table_oid: 1, name: n, type: 'c', columns: [2],
+    def: "CHECK (role = ANY (ARRAY['student'::text, 'admin'::text]))" });
+  const cat = {
+    tables: [{ oid: 1, name: 'users', qualified: 'public.users' }],
+    columns: [
+      { table_oid: 1, attnum: 1, name: 'id', type: 'integer', not_null: true, default_expr: null, identity: 'a', generated: '' },
+      { table_oid: 1, attnum: 2, name: 'role', type: 'text', not_null: true, default_expr: "'student'::text", identity: '', generated: '' }
+    ],
+    constraints: [
+      { table_oid: 1, name: 'users_pkey', type: 'p', columns: [1], def: 'PRIMARY KEY (id)' },
+      check('users_role_check'), check('users_role_check1'), check('users_role_check2'), check('users_role_check3')
+    ],
+    indexes: []
+  };
+  const sql = buildDdl(cat);
+  assert.equal(sql.match(/CHECK/g).length, 1, 'CHECK один раз');
+  assert.match(sql, /role text NOT NULL DEFAULT 'student' CHECK \(role IN \('student', 'admin'\)\)/);
+  assert.deepEqual(duplicateConstraints(cat), [
+    "users: одинаковое ограничение CHECK (role IN ('student', 'admin')) повторяется 4 раза " +
+    '(users_role_check, users_role_check1, users_role_check2, …) — показано один раз'
+  ]);
+});

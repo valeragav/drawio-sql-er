@@ -212,7 +212,7 @@ function showDialog(ui) {
   dbRow.appendChild(schemaInput);
   dbRow.appendChild(connectBtn);
   dbPanel.appendChild(dbRow);
-  const dbNote = el('div', 'font-size:12px;opacity:0.8;');
+  const dbNote = el('div', 'font-size:12px;opacity:0.8;white-space:pre-wrap;max-height:48px;overflow:auto;');
   dbPanel.appendChild(dbNote);
   div.appendChild(dbPanel);
 
@@ -284,7 +284,9 @@ function showDialog(ui) {
     try {
       const res = await requestSchema(url, schemas.length ? schemas : ['public']);
       textarea.value = res.sql;
-      dbNote.textContent = res.message || `Прочитано таблиц: ${res.tables}. Проверьте SQL ниже и нажмите «Вставить».`;
+      let note = res.message || `Прочитано таблиц: ${res.tables}. Проверьте SQL ниже и нажмите «Вставить».`;
+      if (res.warnings && res.warnings.length) note += '\n⚠ ' + res.warnings.join('\n⚠ ');
+      dbNote.textContent = note;
       updateStatus();
     } catch (err) {
       dbNote.textContent = '✖ ' + err.message;

@@ -123,13 +123,54 @@ function columnDdl(col, inline) {
   return [col.name, type, ...parts].join(' ');
 }
 
+// Одинаковые ограничения (тот же тип, те же колонки, то же определение) под разными именами.
+// Так бывает, например, из-за ALTER TABLE … ADD COLUMN IF NOT EXISTS … CHECK (…) при каждом
+// запуске миграции: колонку PostgreSQL пропускает, а CHECK добавляет снова (users_role_check1, 2, …).
+const constraintKey = c => [c.table_oid, c.type, (c.columns || []).join(','), c.def].join('\u0000');
+
+// Сообщения о дублях: «users: одинаковое ограничение CHECK (…) — 52 шт. (users_role_check, …)».
+function duplicateConstraints({ tables, constraints }) {
+  const groups = new Map();
+  for (const c of constraints) {
+    const key = constraintKey(c);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(c);
+  }
+  const messages = [];
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const table = tables.find(t => String(t.oid) === String(group[0].table_oid));
+    const names = group.map(c => c.name);
+    const shown = names.length > 3 ? `${names.slice(0, 3).join(', ')}, …` : names.join(', ');
+    messages.push(`${table ? table.name : '?'}: одинаковое ограничение ${simplifyExpr(group[0].def)} ` +
+      `повторяется ${times(group.length)} (${shown}) — показано один раз`);
+  }
+  return messages;
+}
+
+// 1 раз, 2–4 раза, 5–20 раз, 21 раз, 22 раза…
+function times(n) {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  const word = mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14) ? 'раза' : 'раз';
+  return n + ' ' + word;
+}
+
 // rows: { tables, columns, constraints, indexes } — строки из запросов выше.
 function buildDdl({ tables, columns, constraints, indexes }) {
   const out = [];
+  const seen = new Set();
   for (const table of tables) {
     const oid = String(table.oid);
     const cols = columns.filter(c => String(c.table_oid) === oid);
-    const cons = constraints.filter(c => String(c.table_oid) === oid);
+    // Дубли ограничений показываем один раз (см. duplicateConstraints).
+    const cons = constraints.filter(c => {
+      if (String(c.table_oid) !== oid) return false;
+      const key = constraintKey(c);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
 
     // Ограничения на одну колонку пишем в строке колонки, остальные — отдельно.
     const inlineFor = new Map(cols.map(c => [c.attnum, []]));
@@ -171,11 +212,11 @@ async function introspect(connectionString, schemas = ['public']) {
     const columns = await client.query(COLUMNS_SQL, [oids]);
     const constraints = await client.query(CONSTRAINTS_SQL, [oids]);
     const indexes = await client.query(INDEXES_SQL, [oids]);
-    const sql = buildDdl({ tables, columns: columns.rows, constraints: constraints.rows, indexes: indexes.rows });
-    return { sql, tables: tables.length };
+    const catalog = { tables, columns: columns.rows, constraints: constraints.rows, indexes: indexes.rows };
+    return { sql: buildDdl(catalog), tables: tables.length, warnings: duplicateConstraints(catalog) };
   } finally {
     await client.end();
   }
 }
 
-module.exports = { introspect, buildDdl, columnDdl, simplifyExpr };
+module.exports = { introspect, buildDdl, columnDdl, simplifyExpr, duplicateConstraints };
