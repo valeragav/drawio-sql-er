@@ -22,6 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { introspect } = require('../bridge/introspect');
+const { humanError, safeHost } = require('../bridge/errors');
 
 const root = path.join(__dirname, '..');
 // Не 9229: это порт отладчика Node.js (node --inspect), они бы мешали друг другу.
@@ -132,36 +133,11 @@ class PageSession {
       response = { id: req.id, ...result };
       log(`Готово: таблиц ${result.tables}`);
     } catch (err) {
-      response = { id: req.id, error: humanError(err) };
+      response = { id: req.id, error: humanError(err, req.url) };
       log('Ошибка: ' + response.error);
     }
     await this.evaluate(`window.__sqlErDbResponse(${JSON.stringify(JSON.stringify(response))})`).catch(() => {});
   }
-}
-
-function safeHost(url) {
-  try {
-    const u = new URL(url);
-    return `${u.hostname}:${u.port || 5432}${u.pathname}`;
-  } catch {
-    return '(строка подключения)';
-  }
-}
-
-function humanError(err) {
-  const map = {
-    ECONNREFUSED: 'Сервер не отвечает — проверьте хост и порт, запущен ли PostgreSQL',
-    ENOTFOUND: 'Хост не найден',
-    ETIMEDOUT: 'Превышено время ожидания подключения',
-    '28P01': 'Неверный пользователь или пароль',
-    '3D000': 'База данных не найдена',
-    '28000': 'Доступ запрещён (pg_hba.conf)',
-    '57014': 'База слишком долго отвечает на запрос к каталогу (больше 30 с)',
-    '42501': 'Нет прав на чтение каталога базы'
-  };
-  if (/Query read timeout/i.test(err.message)) return map['57014'];
-  if (/timeout expired|Connection terminated due to connection timeout/i.test(err.message)) return map.ETIMEDOUT;
-  return map[err.code] || err.message;
 }
 
 async function main() {

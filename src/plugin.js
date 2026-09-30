@@ -64,10 +64,14 @@ function addAction(ui, name, label, funct, menuName) {
 
 // ------------------------------------------------------------- мост к базе
 //
-// Сама страница draw.io не может подключиться к PostgreSQL (нет сокетов, а CSP
-// запрещает запросы даже к localhost). Скрипт запуска (npm start) регистрирует
-// в окне функцию window.sqlErDbRequest (Runtime.addBinding): плагин передаёт в неё
-// запрос, скрипт читает схему из базы и возвращает ответ через __sqlErDbResponse.
+// Сама страница draw.io не может подключиться к PostgreSQL (нет сокетов), поэтому
+// схему читает сервер рядом с ней. Два варианта:
+//   - Docker (scripts/server.js): draw.io и API на одном адресе, сервер задаёт
+//     window.SQL_ER_API — плагин отправляет обычный HTTP-запрос;
+//   - draw.io Desktop через npm start: CSP окна запрещает запросы даже к localhost,
+//     поэтому скрипт запуска регистрирует в окне функцию window.sqlErDbRequest
+//     (Runtime.addBinding): плагин передаёт в неё запрос, скрипт читает схему и
+//     возвращает ответ через __sqlErDbResponse.
 
 const BRIDGE = 'sqlErDbRequest';
 const DB_TIMEOUT_MS = 30000;
@@ -78,9 +82,40 @@ let requestSeq = 0;
 // одной её мало: скрипт каждые ~1,5 с отмечается в window.__sqlErBridgeSeen.
 const BRIDGE_ALIVE_MS = 5000;
 
+const apiUrl = () => (typeof window !== 'undefined' && typeof window.SQL_ER_API === 'string' ? window.SQL_ER_API : null);
+
 function bridgeAvailable() {
+  if (apiUrl()) return true;
   return typeof window !== 'undefined' && typeof window[BRIDGE] === 'function' &&
     Date.now() - (window.__sqlErBridgeSeen || 0) < BRIDGE_ALIVE_MS;
+}
+
+// Почему подключение недоступно — текст для окна.
+function bridgeHint() {
+  if (typeof window !== 'undefined' && window.SQL_ER_DB_DISABLED) {
+    return '✖ Подключение к базе выключено на сервере (SQL_ER_DB=off).';
+  }
+  return '✖ Подключение к базе работает, только если draw.io запущен через «npm start» в папке плагина ' +
+    'или открыт с сервера Docker (docker compose up).';
+}
+
+// Docker: POST {url, schemas} → { sql, tables, warnings } | { error }.
+function requestSchemaHttp(url, schemas) {
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller && setTimeout(() => controller.abort(), DB_TIMEOUT_MS * 2);
+  return fetch(apiUrl().replace(/\/$/, '') + '/introspect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, schemas }),
+    signal: controller ? controller.signal : undefined
+  }).then(res => res.json().catch(() => ({ error: `Сервер ответил ${res.status}` })))
+    .then(data => {
+      if (data.error) throw new Error(data.error);
+      return data;
+    }, err => {
+      throw new Error(err && err.name === 'AbortError' ? 'Нет ответа от сервера за 60 секунд' : 'Сервер недоступен');
+    })
+    .finally(() => timer && clearTimeout(timer));
 }
 
 function installBridgeResponse() {
@@ -97,6 +132,7 @@ function installBridgeResponse() {
 }
 
 function requestSchema(url, schemas) {
+  if (apiUrl()) return requestSchemaHttp(url, schemas);
   return new Promise((resolve, reject) => {
     const id = ++requestSeq;
     const timer = setTimeout(() => {
@@ -345,7 +381,7 @@ function showDialog(ui) {
       connectBtn.disabled = !ok;
       dbNote.textContent = ok
         ? 'Только чтение: берётся структура (таблицы, ключи, CHECK, индексы), данные не читаются.'
-        : '✖ Подключение к базе работает, только если draw.io запущен через «npm start» в папке плагина.';
+        : bridgeHint();
     }
     saveSettings({ mode });
   }

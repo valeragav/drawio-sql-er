@@ -19,3 +19,16 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose build
+      - run: docker compose up -d
+      - run: |
+          for i in $(seq 1 30); do curl -fs http://127.0.0.1:8080/healthz && break; sleep 1; done
+          curl -fs http://127.0.0.1:8080/js/PostConfig.js | grep -q "sql-er-plugin.js"
+          curl -fs http://127.0.0.1:8080/sql-er/sql-er-plugin.js | grep -q "Draw.loadPlugin"
+      - if: always()
+        run: docker compose down

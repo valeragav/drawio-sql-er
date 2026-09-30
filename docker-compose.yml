@@ -1,0 +1,15 @@
+services:
+  drawio-sql-er:
+    build: .
+    image: drawio-sql-er:1.0.0
+    ports:
+      # Только для этого компьютера. Чтобы открыть доступ из сети — уберите «127.0.0.1:»
+      # и поставьте впереди прокси с HTTPS (пароль от базы передаётся в запросе).
+      - "127.0.0.1:8080:8080"
+    environment:
+      # off — выключить подключение к базе (останутся вставка SQL и файлы)
+      SQL_ER_DB: "on"
+    extra_hosts:
+      # база на этом компьютере доступна из контейнера как host.docker.internal
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
