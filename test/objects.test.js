@@ -128,3 +128,46 @@ test('SQL из каталога базы: ENUM, представления, ко
   assert.equal(m.tables.find(t => t.name === 'orders').columns[1].comment, "Статус 'заказа'");
   assert.deepEqual(m.viewDeps, [{ table: 'orders', view: 'open_orders' }]);
 });
+
+test('«--»-комментарии: у колонки (в конце строки и над ней), у таблицы, ENUM и представления', () => {
+  const m = parseSql(`
+-- ============================================================
+-- ЧАСТЬ 1: раздел (отделён пустой строкой — не комментарий таблицы)
+-- ============================================================
+
+-- ---------- языки программирования ----------
+CREATE TABLE langs (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,   -- напр. 'Python', 'Scratch'
+    -- порядок в списке
+    -- (меньше — выше)
+    position INT NOT NULL DEFAULT 0,
+    slug TEXT -- для URL
+);
+
+CREATE TABLE posts ( -- записи блога
+    id INT PRIMARY KEY, lang_id INT REFERENCES langs(id) -- язык записи
+);
+COMMENT ON TABLE posts IS 'Из COMMENT ON — важнее';
+
+-- статусы
+CREATE TYPE status AS ENUM ('a', 'b');
+-- активные языки
+CREATE VIEW active_langs AS SELECT id FROM langs;
+ALTER TABLE langs ADD COLUMN archived BOOLEAN NOT NULL DEFAULT false; -- в архиве
+  `);
+  const langs = m.tables.find(t => t.name === 'langs');
+  assert.equal(langs.comment, 'языки программирования');
+  assert.deepEqual(langs.columns.map(c => [c.name, c.comment]), [
+    ['id', null],
+    ['name', "напр. 'Python', 'Scratch'"],
+    ['position', 'порядок в списке (меньше — выше)'],
+    ['slug', 'для URL'],
+    ['archived', 'в архиве']
+  ]);
+  const posts = m.tables.find(t => t.name === 'posts');
+  assert.equal(posts.comment, 'Из COMMENT ON — важнее');
+  assert.equal(posts.columns.find(c => c.name === 'lang_id').comment, 'язык записи');
+  assert.equal(m.enums[0].comment, 'статусы');
+  assert.equal(m.tables.find(t => t.name === 'active_langs').comment, 'активные языки');
+});

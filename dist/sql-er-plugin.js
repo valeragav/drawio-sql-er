@@ -27,7 +27,8 @@ const SERIAL_TYPE = /^(SMALL|BIG)?SERIAL[248]?$/i;
 
 // ---------------------------------------------------------------- токенизатор
 
-function tokenize(src) {
+// comments — если передан массив, в него складываются «--»-комментарии { start, end, text }.
+function tokenize(src, comments) {
   const tokens = [];
   const n = src.length;
   let i = 0;
@@ -39,6 +40,8 @@ function tokenize(src) {
 
     if (c === '-' && src[i + 1] === '-') {
       const e = src.indexOf('\n', i);
+      const end = e < 0 ? n : e;
+      if (comments) comments.push({ start: i, end, text: src.slice(i + 2, end).trim() });
       i = e < 0 ? n : e + 1;
       continue;
     }
@@ -256,7 +259,9 @@ function columnList(tokens) {
 function parseSql(src) {
   const state = { tables: [], byName: new Map(), enums: [], enumByName: new Map(), comments: [], warnings: [] };
 
-  for (const stmt of splitStatements(tokenize(src))) {
+  state.lineComments = [];
+  state.src = src;
+  for (const stmt of splitStatements(tokenize(src, state.lineComments))) {
     const cur = new Cursor(stmt, src);
     try {
       if (cur.isWord('CREATE')) parseCreate(cur, state);
@@ -287,16 +292,18 @@ function parseCreate(cur, state) {
   if (!parts) return;
 
   // CREATE TABLE ... AS SELECT / PARTITION OF / OF type — колонок в скобках нет.
+  const open = cur.peek();
   const body = cur.group();
   if (!body) return;
 
   const table = addTable(state, parts);
   if (!table) return;
+  table.comment = trailingComment(state, open ? open.end : 0) || leadingComment(state, cur.tokens[0].start);
 
   for (const item of splitTopLevel(body)) {
     const c = new Cursor(item, cur.src);
     if (isTableConstraint(c)) parseTableConstraint(c, table);
-    else if (!c.isWord('LIKE')) parseColumn(c, table);
+    else if (!c.isWord('LIKE')) parseColumn(c, table, state);
   }
 }
 
@@ -384,7 +391,7 @@ function parseAlter(cur, state) {
         const name = c.peek() && identValue(c.peek());
         const existing = table.columns.find(col => col.name === name);
         if (existing && ifNotExists) continue;
-        parseColumn(c, table);
+        parseColumn(c, table, state);
       }
       continue;
     }
@@ -455,7 +462,7 @@ function parseReference(c) {
   return { refTable, refColumns: group ? columnList(group) : null };
 }
 
-function parseColumn(c, table) {
+function parseColumn(c, table, state) {
   const nameTok = c.next();
   if (!nameTok || (nameTok.type !== 'word' && nameTok.type !== 'ident')) return;
 
@@ -534,6 +541,10 @@ function parseColumn(c, table) {
   }
 
   col.constraints = c.text(constraintsStart, c.tokens.length);
+  // «--» в конце строки колонки или строками прямо над ней.
+  if (state) {
+    col.comment = trailingComment(state, c.tokens[c.tokens.length - 1].end) || leadingComment(state, nameTok.start);
+  }
   table.columns.push(col);
 }
 
@@ -558,7 +569,7 @@ function parseType(cur, state) {
     state.warnings.push(`Тип ${parts.join('.')} объявлен повторно — взято первое объявление`);
     return;
   }
-  const en = { name: displayName(parts), parts, values, comment: null };
+  const en = { name: displayName(parts), parts, values, comment: leadingComment(state, cur.tokens[0].start) };
   state.enums.push(en);
   state.enumByName.set(key, en);
 }
@@ -611,6 +622,7 @@ function parseView(cur, state, materialized) {
 
   const view = addTable(state, parts, materialized ? 'materialized view' : 'view');
   if (!view) return;
+  view.comment = leadingComment(state, cur.tokens[0].start);
   for (const name of explicit || selectColumns(query)) view.columns.push(blankColumn(name));
   view.deps = viewDependencies(query);
 }
@@ -738,6 +750,43 @@ function parseComment(cur, state) {
   const tok = cur.next();
   const text = isWordTok(tok, 'NULL') ? null : stringValue(tok);
   state.comments.push({ kind, parts, text });
+}
+
+// ------------------------------------------------------ «--»-комментарии
+
+// Декоративные строки (-- =====, -- -----) комментарием не считаем, а у заголовков
+// вида «---------- курсы ----------» убираем рамку из чёрточек: остаётся «курсы».
+const isDecorative = text => !/[\p{L}\p{N}]/u.test(text);
+const cleanComment = text => text.replace(/^[-=*#_~\s]{3,}|[-=*#_~\s]{3,}$/g, '').trim();
+
+// Комментарий в конце строки: после pos на той же строке (допускается запятая).
+function trailingComment(state, pos) {
+  for (const cm of state.lineComments) {
+    if (cm.start < pos) continue;
+    if (!/^[ \t,;]*$/.test(state.src.slice(pos, cm.start))) return null;
+    return isDecorative(cm.text) ? null : cleanComment(cm.text) || null;
+  }
+  return null;
+}
+
+// Комментарий строками прямо над pos: подряд идущие «--»-строки без пустых строк между
+// ними и кодом; каждая строка — только комментарий (без кода перед ним).
+function leadingComment(state, pos) {
+  const { src, lineComments } = state;
+  const lines = [];
+  let cursor = pos;
+  for (let i = lineComments.length - 1; i >= 0; i--) {
+    const cm = lineComments[i];
+    if (cm.end > cursor) continue;
+    const gap = src.slice(cm.end, cursor);
+    if (!/^\s*$/.test(gap) || (gap.match(/\n/g) || []).length > 1) break;
+    const lineStart = src.lastIndexOf('\n', cm.start - 1) + 1;
+    if (!/^[ \t]*$/.test(src.slice(lineStart, cm.start))) break; // перед ним код — это чужой «хвост»
+    lines.unshift(cm.text);
+    cursor = lineStart;
+  }
+  const text = lines.filter(t => t && !isDecorative(t)).map(cleanComment).join(' ').trim();
+  return text || null;
 }
 
 // ------------------------------------------------------------------ таблицы
@@ -3336,6 +3385,6 @@ if (typeof Draw !== 'undefined' && Draw.loadPlugin) {
 
   };
 
-  if (typeof window !== 'undefined') window.__sqlErBuild = "e732d12143f7";
+  if (typeof window !== 'undefined') window.__sqlErBuild = "e79b1d27c3a4";
   require("plugin");
 })();
