@@ -6,7 +6,8 @@
 
 const TABLES_SQL = `
   SELECT c.oid, n.nspname AS schema, c.relname AS name,
-         format('%I.%I', n.nspname, c.relname) AS qualified
+         format('%I.%I', n.nspname, c.relname) AS qualified,
+         obj_description(c.oid, 'pg_class') AS comment
   FROM pg_class c
   JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE c.relkind IN ('r', 'p')
@@ -20,7 +21,8 @@ const COLUMNS_SQL = `
          a.attnotnull AS not_null,
          pg_get_expr(d.adbin, d.adrelid) AS default_expr,
          a.attidentity AS identity,
-         to_jsonb(a) ->> 'attgenerated' AS generated
+         to_jsonb(a) ->> 'attgenerated' AS generated,
+         col_description(a.attrelid, a.attnum) AS comment
   FROM pg_attribute a
   LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
   WHERE a.attrelid = ANY($1::oid[]) AND a.attnum > 0 AND NOT a.attisdropped
@@ -41,6 +43,42 @@ const INDEXES_SQL = `
   WHERE i.indrelid = ANY($1::oid[])
     AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid AND c.contype IN ('p', 'u', 'x'))
   ORDER BY i.indrelid, ic.relname`;
+
+// Перечисления (ENUM) со значениями в их порядке.
+const ENUMS_SQL = `
+  SELECT t.oid, format('%I.%I', n.nspname, t.typname) AS qualified,
+         obj_description(t.oid, 'pg_type') AS comment,
+         array_agg(e.enumlabel::text ORDER BY e.enumsortorder) AS labels
+  FROM pg_type t
+  JOIN pg_namespace n ON n.oid = t.typnamespace
+  JOIN pg_enum e ON e.enumtypid = t.oid
+  WHERE n.nspname = ANY($1::text[])
+  GROUP BY t.oid, n.nspname, t.typname
+  ORDER BY n.nspname, t.typname`;
+
+// Представления и материализованные представления: текст запроса и имена колонок.
+const VIEWS_SQL = `
+  SELECT c.oid, c.relkind AS kind, format('%I.%I', n.nspname, c.relname) AS qualified,
+         pg_get_viewdef(c.oid, true) AS def,
+         obj_description(c.oid, 'pg_class') AS comment,
+         (SELECT array_agg(quote_ident(a.attname) ORDER BY a.attnum)
+            FROM pg_attribute a
+           WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped) AS columns
+  FROM pg_class c
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE c.relkind IN ('v', 'm') AND n.nspname = ANY($1::text[])
+  ORDER BY n.nspname, c.relname`;
+
+const sqlString = text => "'" + String(text).replace(/'/g, "''") + "'";
+
+function stripEnumCasts(text, enums) {
+  let out = text;
+  for (const en of enums) {
+    const name = en.qualified.split('.').pop().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    out = out.replace(new RegExp(`('(?:[^']|'')*')::(?:[\\w"]+\\.)?${name}(\\[\\])?(?![\\w])`, 'g'), '$1');
+  }
+  return out;
+}
 
 const SERIAL_TYPES = { smallint: 'smallserial', integer: 'serial', bigint: 'bigserial' };
 
@@ -157,8 +195,12 @@ function times(n) {
 }
 
 // rows: { tables, columns, constraints, indexes } — строки из запросов выше.
-function buildDdl({ tables, columns, constraints, indexes }) {
+function buildDdl({ tables, columns, constraints, indexes, enums = [], views = [] }) {
   const out = [];
+  for (const en of enums) {
+    out.push(`CREATE TYPE ${en.qualified} AS ENUM (${(en.labels || []).map(sqlString).join(', ')});`);
+  }
+  if (enums.length) out.push('');
   for (const table of tables) {
     const oid = String(table.oid);
     const cols = columns.filter(c => String(c.table_oid) === oid);
@@ -174,13 +216,35 @@ function buildDdl({ tables, columns, constraints, indexes }) {
       else tableLevel.push(`CONSTRAINT ${con.name} ${con.type === 'c' ? simplifyExpr(con.def) : con.def}`);
     }
 
-    const lines = cols.map(c => '    ' + columnDdl(c, inlineFor.get(c.attnum)));
+    // 'new'::order_status → 'new' (приведение к своему ENUM в значениях по умолчанию лишнее).
+    const lines = cols.map(c => '    ' + stripEnumCasts(columnDdl(c, inlineFor.get(c.attnum)), enums));
     tableLevel.forEach(def => lines.push('    ' + def));
     out.push(`CREATE TABLE ${table.qualified} (\n${lines.join(',\n')}\n);`);
 
     for (const ix of indexes.filter(i => String(i.table_oid) === oid)) out.push(simplifyExpr(ix.def) + ';');
     out.push('');
   }
+
+  for (const v of views) {
+    const kind = v.kind === 'm' ? 'MATERIALIZED VIEW' : 'VIEW';
+    const cols = v.columns && v.columns.length ? ` (${v.columns.join(', ')})` : '';
+    out.push(`CREATE ${kind} ${v.qualified}${cols} AS\n${String(v.def || '').trim().replace(/;\s*$/, '')};`);
+    out.push('');
+  }
+
+  // Комментарии — отдельными COMMENT ON, как в pg_dump.
+  const comments = [];
+  for (const en of enums) if (en.comment) comments.push(`COMMENT ON TYPE ${en.qualified} IS ${sqlString(en.comment)};`);
+  for (const t of tables) {
+    if (t.comment) comments.push(`COMMENT ON TABLE ${t.qualified} IS ${sqlString(t.comment)};`);
+    for (const c of columns.filter(col => String(col.table_oid) === String(t.oid) && col.comment)) {
+      comments.push(`COMMENT ON COLUMN ${t.qualified}.${c.name} IS ${sqlString(c.comment)};`);
+    }
+  }
+  for (const v of views) {
+    if (v.comment) comments.push(`COMMENT ON ${v.kind === 'm' ? 'MATERIALIZED VIEW' : 'VIEW'} ${v.qualified} IS ${sqlString(v.comment)};`);
+  }
+  out.push(...comments);
   return out.join('\n');
 }
 
@@ -198,14 +262,18 @@ async function introspect(connectionString, schemas = ['public']) {
   try {
     await client.query('SET default_transaction_read_only = on');
     const tables = (await client.query(TABLES_SQL, [schemas])).rows;
-    if (!tables.length) {
+    const enums = (await client.query(ENUMS_SQL, [schemas])).rows;
+    const views = (await client.query(VIEWS_SQL, [schemas])).rows;
+    if (!tables.length && !views.length) {
       return { sql: '', tables: 0, message: `В схемах ${schemas.join(', ')} нет таблиц` };
     }
     const oids = tables.map(t => t.oid);
     const columns = await client.query(COLUMNS_SQL, [oids]);
     const constraints = await client.query(CONSTRAINTS_SQL, [oids]);
     const indexes = await client.query(INDEXES_SQL, [oids]);
-    const catalog = { tables, columns: columns.rows, constraints: constraints.rows, indexes: indexes.rows };
+    const catalog = {
+      tables, columns: columns.rows, constraints: constraints.rows, indexes: indexes.rows, enums, views
+    };
     return { sql: buildDdl(catalog), tables: tables.length, warnings: duplicateConstraints(catalog) };
   } finally {
     await client.end();

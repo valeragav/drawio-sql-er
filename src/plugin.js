@@ -252,7 +252,10 @@ function showDialog(ui) {
     const model = parseSql(textarea.value);
     picker.setSchema(model);
     const indexes = model.tables.reduce((n, t) => n + t.indexes.length, 0);
-    let text = `Таблиц: ${model.tables.length}, связей: ${model.relations.length}, индексов: ${indexes}`;
+    const views = model.tables.filter(t => t.kind && t.kind !== 'table').length;
+    let text = `Таблиц: ${model.tables.length - views}, связей: ${model.relations.length}, индексов: ${indexes}`;
+    if (views) text += `, представлений: ${views}`;
+    if (model.enums && model.enums.length) text += `, ENUM: ${model.enums.length}`;
     const warnings = sourceWarnings.concat(model.warnings);
     if (warnings.length) text += '\n⚠ ' + warnings.join('\n⚠ ');
     status.textContent = text;
@@ -335,6 +338,9 @@ function showDialog(ui) {
   const detailBox = checkbox(options, 'Ограничения как в SQL', true);
   const nullableBox = checkbox(options, 'Показывать NULL', true);
   const indexesBox = checkbox(options, 'Показывать индексы', true);
+  const enumsBox = checkbox(options, 'ENUM', true);
+  const viewsBox = checkbox(options, 'Представления', true);
+  const commentsBox = checkbox(options, 'Комментарии', true);
   // «NULL» — метка короткого режима; в режиме SQL видно, есть ли NOT NULL.
   const syncNullable = () => {
     nullableBox.disabled = detailBox.checked;
@@ -365,6 +371,9 @@ function showDialog(ui) {
     detail: detailBox.checked ? 'sql' : 'tags',
     showNullable: nullableBox.checked,
     showIndexes: indexesBox.checked,
+    showEnums: enumsBox.checked,
+    showViews: viewsBox.checked,
+    showComments: commentsBox.checked,
     measureText
   });
 

@@ -13,8 +13,9 @@
   defs["parser"] = function (module, exports, require) {
 'use strict';
 
-// Разбор PostgreSQL DDL (CREATE TABLE / ALTER TABLE) в модель для ER-диаграммы.
-// Всё остальное (индексы, функции, INSERT, COMMENT ON ...) пропускается.
+// Разбор PostgreSQL DDL в модель для ER-диаграммы: таблицы (CREATE/ALTER TABLE), индексы,
+// перечисления (CREATE/ALTER TYPE … ENUM), представления (CREATE [MATERIALIZED] VIEW)
+// и комментарии (COMMENT ON). Всё остальное (функции, INSERT, …) пропускается.
 
 // Слова, на которых заканчивается тип колонки и начинаются её ограничения.
 const COLUMN_STOP = new Set([
@@ -253,13 +254,14 @@ function columnList(tokens) {
 // ------------------------------------------------------------------- парсер
 
 function parseSql(src) {
-  const state = { tables: [], byName: new Map(), warnings: [] };
+  const state = { tables: [], byName: new Map(), enums: [], enumByName: new Map(), comments: [], warnings: [] };
 
   for (const stmt of splitStatements(tokenize(src))) {
     const cur = new Cursor(stmt, src);
     try {
       if (cur.isWord('CREATE')) parseCreate(cur, state);
       else if (cur.isWord('ALTER')) parseAlter(cur, state);
+      else if (cur.isWord('COMMENT')) parseComment(cur, state);
     } catch (err) {
       state.warnings.push(`Не удалось разобрать: ${cur.text(0, Math.min(stmt.length, 8))}… (${err.message})`);
     }
@@ -274,6 +276,10 @@ function parseCreate(cur, state) {
   cur.acceptWords('OR', 'REPLACE');
   cur.acceptWord('GLOBAL', 'LOCAL');
   cur.acceptWord('TEMP', 'TEMPORARY', 'UNLOGGED');
+  if (cur.acceptWord('TYPE')) return parseType(cur, state);
+  cur.acceptWord('RECURSIVE');
+  if (cur.acceptWords('MATERIALIZED', 'VIEW')) return parseView(cur, state, true);
+  if (cur.acceptWord('VIEW')) return parseView(cur, state, false);
   if (!cur.acceptWord('TABLE')) return;
   cur.acceptWords('IF', 'NOT', 'EXISTS');
 
@@ -349,6 +355,7 @@ function tokensText(tokens, src) {
 
 function parseAlter(cur, state) {
   cur.next(); // ALTER
+  if (cur.acceptWord('TYPE')) return parseAlterType(cur, state);
   if (!cur.acceptWord('TABLE')) return;
   cur.acceptWords('IF', 'EXISTS');
   cur.acceptWord('ONLY');
@@ -460,7 +467,8 @@ function parseColumn(c, table) {
     unique: false,
     autoIncrement: false,
     default: null,
-    constraints: '' // всё после типа, как написано в SQL
+    constraints: '', // всё после типа, как написано в SQL
+    comment: null
   };
 
   // Тип: всё до первого ключевого слова ограничения (скобки целиком).
@@ -529,13 +537,216 @@ function parseColumn(c, table) {
   table.columns.push(col);
 }
 
+// ------------------------------------------------------ ENUM, VIEW, COMMENT
+
+// Строковый литерал → значение: 'it''s' → it's, E'a\'b' → a'b, $$…$$ → …
+function stringValue(t) {
+  if (!t || t.type !== 'string') return null;
+  const v = t.value;
+  if (/^[Ee]'/.test(v)) return v.slice(2, -1).replace(/\\(.)/g, '$1').replace(/''/g, "'");
+  if (v.startsWith('$')) return v.replace(/^\$[^$]*\$/, '').replace(/\$[^$]*\$$/, '');
+  return v.slice(1, -1).replace(/''/g, "'");
+}
+
+// CREATE TYPE имя AS ENUM ('a', 'b', …) — составные и прочие типы пропускаем.
+function parseType(cur, state) {
+  const parts = cur.name();
+  if (!parts || !cur.acceptWord('AS') || !cur.acceptWord('ENUM')) return;
+  const values = (cur.group() || []).filter(t => t.type === 'string').map(stringValue);
+  const key = tableKey(parts);
+  if (state.enumByName.has(key)) {
+    state.warnings.push(`Тип ${parts.join('.')} объявлен повторно — взято первое объявление`);
+    return;
+  }
+  const en = { name: displayName(parts), parts, values, comment: null };
+  state.enums.push(en);
+  state.enumByName.set(key, en);
+}
+
+// ALTER TYPE имя ADD VALUE [IF NOT EXISTS] 'x' [BEFORE | AFTER 'y']  |  RENAME VALUE 'a' TO 'b'.
+function parseAlterType(cur, state) {
+  const parts = cur.name();
+  if (!parts) return;
+  const en = findEnum(state, parts);
+  if (!en) return;
+  if (cur.acceptWords('ADD', 'VALUE')) {
+    cur.acceptWords('IF', 'NOT', 'EXISTS');
+    const value = stringValue(cur.next());
+    if (value === null || en.values.includes(value)) return;
+    let at = en.values.length;
+    if (cur.isWord('BEFORE', 'AFTER')) {
+      const after = cur.next().upper === 'AFTER';
+      const i = en.values.indexOf(stringValue(cur.next()));
+      if (i >= 0) at = after ? i + 1 : i;
+    }
+    en.values.splice(at, 0, value);
+  } else if (cur.acceptWords('RENAME', 'VALUE')) {
+    const from = stringValue(cur.next());
+    cur.acceptWord('TO');
+    const to = stringValue(cur.next());
+    const i = en.values.indexOf(from);
+    if (i >= 0 && to !== null) en.values[i] = to;
+  }
+}
+
+function findEnum(state, parts) {
+  const exact = state.enumByName.get(tableKey(parts));
+  if (exact) return exact;
+  const last = parts[parts.length - 1].toLowerCase();
+  const matches = state.enums.filter(e => e.parts[e.parts.length - 1].toLowerCase() === last);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+// CREATE [MATERIALIZED] VIEW [IF NOT EXISTS] имя [(колонки)] [WITH (…)] AS SELECT …
+// Колонки — из списка в скобках или из SELECT (псевдонимы AS, t.col → col, *);
+// зависимости — таблицы из FROM / JOIN (кроме имён из WITH).
+function parseView(cur, state, materialized) {
+  cur.acceptWords('IF', 'NOT', 'EXISTS');
+  const parts = cur.name();
+  if (!parts) return;
+  const explicit = cur.isPunct('(') ? columnList(cur.group()) : null;
+  if (cur.acceptWord('WITH')) cur.skipGroup();
+  if (!cur.acceptWord('AS')) return;
+  const query = cur.tokens.slice(cur.pos);
+
+  const view = addTable(state, parts, materialized ? 'materialized view' : 'view');
+  if (!view) return;
+  for (const name of explicit || selectColumns(query)) view.columns.push(blankColumn(name));
+  view.deps = viewDependencies(query);
+}
+
+function blankColumn(name) {
+  return {
+    name, type: '', notNull: false, primaryKey: false, unique: false,
+    autoIncrement: false, default: null, constraints: '', comment: null
+  };
+}
+
+const isWordTok = (t, ...words) => !!t && t.type === 'word' && words.includes(t.upper);
+const isPunctTok = (t, value) => !!t && t.type === 'punct' && t.value === value;
+
+// Имена колонок результата первого SELECT верхнего уровня.
+function selectColumns(tokens) {
+  const ENDS = ['FROM', 'UNION', 'EXCEPT', 'INTERSECT', 'ORDER', 'LIMIT', 'WHERE', 'GROUP'];
+  let depth = 0;
+  let start = -1;
+  let end = tokens.length;
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (isPunctTok(t, '(')) depth++;
+    else if (isPunctTok(t, ')')) depth--;
+    else if (depth === 0 && start < 0 && isWordTok(t, 'SELECT')) start = i + 1;
+    else if (depth === 0 && start >= 0 && isWordTok(t, ...ENDS)) {
+      end = i;
+      break;
+    }
+  }
+  if (start < 0) return [];
+  let items = tokens.slice(start, end);
+  if (isWordTok(items[0], 'ALL')) items = items.slice(1);
+  if (isWordTok(items[0], 'DISTINCT')) {
+    items = items.slice(1);
+    if (isWordTok(items[0], 'ON') && isPunctTok(items[1], '(')) {
+      let d = 0;
+      let k = 1;
+      for (; k < items.length; k++) {
+        if (isPunctTok(items[k], '(')) d++;
+        if (isPunctTok(items[k], ')') && --d === 0) break;
+      }
+      items = items.slice(k + 1);
+    }
+  }
+  return splitTopLevel(items).map(outputName).filter(Boolean);
+}
+
+// Имя колонки результата: «expr AS x» → x, «t.col» → col, «col» → col, «expr x» → x, «*» → *.
+function outputName(item) {
+  if (!item.length) return null;
+  const last = item[item.length - 1];
+  const prev = item[item.length - 2];
+  if (isPunctTok(last, '*')) return '*';
+  // Вызов функции без псевдонима — PostgreSQL называет колонку именем функции: upper(x) → upper.
+  if (isPunctTok(last, ')') && item[0].type === 'word' && isPunctTok(item[1], '(')) return identValue(item[0]);
+  if (last.type === 'ident' || last.type === 'word') {
+    if (item.length === 1 || isWordTok(prev, 'AS') || isPunctTok(prev, '.')) return identValue(last);
+    if (prev && !(prev.type === 'punct' && prev.value !== ')')) return identValue(last);
+  }
+  return '?column?';
+}
+
+const FROM_STOP = ['WHERE', 'JOIN', 'LEFT', 'RIGHT', 'INNER', 'FULL', 'CROSS', 'NATURAL', 'ON', 'GROUP',
+  'ORDER', 'LIMIT', 'UNION', 'EXCEPT', 'INTERSECT', 'HAVING', 'WINDOW', 'USING', 'OFFSET', 'FETCH', 'FOR'];
+
+// Таблицы из FROM / JOIN на любой глубине (в подзапросах тоже), кроме имён CTE (WITH x AS …).
+function viewDependencies(tokens) {
+  const ctes = new Set();
+  for (let i = 1; i + 2 < tokens.length; i++) {
+    const t = tokens[i];
+    if ((t.type === 'word' || t.type === 'ident') && isWordTok(tokens[i + 1], 'AS') &&
+        isPunctTok(tokens[i + 2], '(') &&
+        (isWordTok(tokens[i - 1], 'WITH', 'RECURSIVE') || isPunctTok(tokens[i - 1], ','))) {
+      ctes.add(identValue(t));
+    }
+  }
+
+  const deps = [];
+  const seen = new Set();
+  const add = parts => {
+    if (parts.length === 1 && ctes.has(parts[0])) return;
+    const key = parts.join('.').toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      deps.push(parts);
+    }
+  };
+
+  const c = new Cursor(tokens, '');
+  while (!c.done()) {
+    const t = c.next();
+    if (!isWordTok(t, 'FROM', 'JOIN')) continue;
+    for (;;) {
+      c.acceptWord('ONLY', 'LATERAL');
+      if (c.isPunct('(')) break; // подзапрос — его FROM встретим дальше
+      const parts = c.name();
+      if (!parts) break;
+      if (c.isPunct('(')) break; // функция: FROM generate_series(…)
+      add(parts);
+      if (t.upper === 'JOIN') break;
+      c.acceptWord('AS');
+      const next = c.peek();
+      if (next && (next.type === 'ident' || (next.type === 'word' && !FROM_STOP.includes(next.upper)))) {
+        c.next();
+        if (c.isPunct('(')) c.skipGroup(); // псевдоним со списком колонок
+      }
+      if (!c.isPunct(',')) break;
+      c.next();
+    }
+  }
+  return deps;
+}
+
+// COMMENT ON TABLE | VIEW | MATERIALIZED VIEW | TYPE имя IS '…' | NULL;  COMMENT ON COLUMN t.c IS '…'.
+function parseComment(cur, state) {
+  cur.next(); // COMMENT
+  if (!cur.acceptWord('ON')) return;
+  let kind;
+  if (cur.acceptWords('MATERIALIZED', 'VIEW')) kind = 'view';
+  else if (cur.isWord('TABLE', 'VIEW', 'TYPE', 'COLUMN')) kind = cur.next().upper.toLowerCase();
+  else return;
+  const parts = cur.name();
+  if (!parts || !cur.acceptWord('IS')) return;
+  const tok = cur.next();
+  const text = isWordTok(tok, 'NULL') ? null : stringValue(tok);
+  state.comments.push({ kind, parts, text });
+}
+
 // ------------------------------------------------------------------ таблицы
 
 function tableKey(parts) {
   return parts.join('.').toLowerCase();
 }
 
-function addTable(state, parts) {
+function addTable(state, parts, kind = 'table') {
   const key = tableKey(parts);
   if (state.byName.has(key)) {
     state.warnings.push(`Таблица ${parts.join('.')} объявлена повторно — взято первое объявление`);
@@ -544,6 +755,9 @@ function addTable(state, parts) {
   const table = {
     name: displayName(parts),
     parts,
+    kind, // 'table' | 'view' | 'materialized view'
+    comment: null,
+    deps: [], // для представлений: таблицы из FROM / JOIN
     columns: [],
     primaryKey: [],
     uniques: [],
@@ -663,9 +877,52 @@ function finalize(state) {
     }
   }
 
+  // COMMENT ON … — в конце, потому что pg_dump пишет комментарии после всех объектов.
+  for (const cm of state.comments) {
+    if (cm.kind === 'column') {
+      if (cm.parts.length < 2) continue;
+      const table = findTable(state, cm.parts.slice(0, -1));
+      const col = table && table.columns.find(c => c.name === cm.parts[cm.parts.length - 1]);
+      if (col) col.comment = cm.text;
+    } else if (cm.kind === 'type') {
+      const en = findEnum(state, cm.parts);
+      if (en) en.comment = cm.text;
+    } else {
+      const table = findTable(state, cm.parts);
+      if (table) table.comment = cm.text;
+    }
+  }
+
+  // Колонки типа-перечисления (в т.ч. массивы: status[]) → связь с блоком ENUM.
+  const enumLinks = [];
+  for (const table of tables) {
+    for (const col of table.columns) {
+      if (!col.type) continue;
+      // Имя типа как в PostgreSQL: без кавычек — в нижний регистр, в кавычках — как есть.
+      const base = col.type.replace(/\s*\[\]$/, '').replace(/\s+ARRAY$/i, '');
+      const typeParts = base.split('.').map(p => (/^".*"$/.test(p) ? p.slice(1, -1) : p.toLowerCase()));
+      const en = findEnum(state, typeParts);
+      if (en) enumLinks.push({ enum: en.name, table: table.name, column: col.name });
+    }
+  }
+
+  // Представление ← таблицы (и другие представления) из его FROM / JOIN.
+  const viewDeps = [];
+  for (const view of tables) {
+    for (const parts of view.deps) {
+      const source = findTable(state, parts);
+      if (source && source !== view) viewDeps.push({ table: source.name, view: view.name });
+    }
+  }
+
   return {
+    enums: state.enums.map(e => ({ name: e.name, values: e.values.slice(), comment: e.comment })),
+    enumLinks,
+    viewDeps,
     tables: tables.map(t => ({
       name: t.name,
+      kind: t.kind,
+      comment: t.comment,
       columns: t.columns.map(c => ({
         name: c.name,
         type: c.type,
@@ -675,7 +932,8 @@ function finalize(state) {
         notNull: c.notNull,
         autoIncrement: c.autoIncrement,
         default: c.default,
-        constraints: c.constraints
+        constraints: c.constraints,
+        comment: c.comment
       })),
       primaryKey: t.primaryKey,
       compositeUniques: t.compositeUniques,
@@ -968,24 +1226,37 @@ module.exports = { placeNewTables };
 'use strict';
 
 // Выбор части таблиц схемы (для больших схем, когда на страницу нужна только часть).
+// «Таблицы» здесь — и представления (VIEW): они в том же списке.
 
 // Схема только с таблицами из names; связи — только между выбранными таблицами.
 // Внешние ключи на невыбранные таблицы остаются в строках колонок (REFERENCES …), но без линий.
+// Перечисления (ENUM) — те, что используют выбранные таблицы; если выбрано всё — все.
 function selectTables(schema, names) {
   const keep = new Set(names);
+  const all = schema.tables.every(t => keep.has(t.name));
+  const enumLinks = (schema.enumLinks || []).filter(l => keep.has(l.table));
+  const usedEnums = new Set(enumLinks.map(l => l.enum));
   return Object.assign({}, schema, {
     tables: schema.tables.filter(t => keep.has(t.name)),
-    relations: schema.relations.filter(r => keep.has(r.parent) && keep.has(r.child))
+    relations: schema.relations.filter(r => keep.has(r.parent) && keep.has(r.child)),
+    enums: (schema.enums || []).filter(e => all || usedEnums.has(e.name)),
+    enumLinks,
+    viewDeps: (schema.viewDeps || []).filter(d => keep.has(d.table) && keep.has(d.view))
   });
 }
 
-// Выбранные таблицы + их непосредственные соседи (родители и дети).
+// Выбранные таблицы + их непосредственные соседи: родители и дети по внешним ключам,
+// таблицы из FROM/JOIN представлений и представления, построенные на таблицах.
 function withRelated(schema, names) {
   const selected = new Set(names);
   const result = new Set(names);
   for (const r of schema.relations) {
     if (selected.has(r.parent)) result.add(r.child);
     if (selected.has(r.child)) result.add(r.parent);
+  }
+  for (const d of schema.viewDeps || []) {
+    if (selected.has(d.table)) result.add(d.view);
+    if (selected.has(d.view)) result.add(d.table);
   }
   return schema.tables.map(t => t.name).filter(n => result.has(n));
 }
@@ -1000,6 +1271,8 @@ module.exports = { selectTables, withRelated };
 // Модель из parser.js → XML графа draw.io (mxGraphModel).
 // Таблица — swimlane со стек-раскладкой, каждая колонка — отдельная строка-ячейка,
 // связи соединяют строки (PK родителя → FK ребёнка) в нотации «воронья лапка».
+// Представления — такие же блоки с пунктирной рамкой (стрелки от таблиц из FROM/JOIN),
+// перечисления (ENUM) — блоки со значениями (пунктир к колонкам этого типа).
 
 const { planLanes, gapWidth, routeLinks } = require('./routing');
 
@@ -1024,6 +1297,11 @@ const ROW_STYLE =
   'rotatable=0;points=[[0,0.5],[1,0.5]];portConstraint=eastwest;html=1;';
 
 const NOTE_STYLE = ROW_STYLE + 'fontSize=11;textOpacity=60;';
+const COMMENT_STYLE = NOTE_STYLE + 'fontStyle=2;';
+
+const VIEW_STYLE = TABLE_STYLE + 'dashed=1;dashPattern=8 4;';
+const ENUM_STYLE = TABLE_STYLE.replace('fontStyle=1;', 'fontStyle=3;') + 'rounded=1;arcSize=6;';
+const NODE_STYLES = { table: TABLE_STYLE, view: VIEW_STYLE, 'materialized view': VIEW_STYLE, enum: ENUM_STYLE };
 const NOTE_HEIGHT = 20;
 
 // Разделитель между колонками и блоком индексов/ограничений (как в ER-фигурах draw.io).
@@ -1035,6 +1313,9 @@ const DIVIDER_HEIGHT = 8;
 const DEFAULTS = {
   showNullable: true,
   showIndexes: true,
+  showEnums: true,
+  showViews: true,
+  showComments: true,
   detail: 'sql',
   x: 0,
   y: 0
@@ -1082,12 +1363,21 @@ function indexLabel(index) {
 // Строки таблицы: колонки, затем (через разделитель) составные UNIQUE и индексы.
 // y — смещение строки от верха таблицы.
 function buildRows(table, opts) {
-  const rows = table.columns.map(col => ({
-    column: col.name,
-    label: columnLabel(col, opts),
-    style: ROW_STYLE + (fontStyle(col) ? 'fontStyle=' + fontStyle(col) + ';' : ''),
-    height: ROW_HEIGHT
-  }));
+  const rows = [];
+  // COMMENT ON TABLE — мелкой строкой сразу под заголовком.
+  if (opts.showComments && table.comment) rows.push(commentRow(table.comment));
+
+  for (const col of table.columns) {
+    // COMMENT ON COLUMN — всплывающей подсказкой; значок 💬 показывает, что она есть.
+    const comment = opts.showComments && col.comment ? col.comment : null;
+    rows.push({
+      column: col.name,
+      label: columnLabel(col, opts) + (comment ? ' 💬' : ''),
+      tooltip: comment,
+      style: ROW_STYLE + (fontStyle(col) ? 'fontStyle=' + fontStyle(col) + ';' : ''),
+      height: ROW_HEIGHT
+    });
+  }
 
   const notes = opts.detail === 'tags'
     ? (table.compositeUniques || []).map(cols => 'UNIQUE (' + cols.join(', ') + ')')
@@ -1100,8 +1390,66 @@ function buildRows(table, opts) {
   return rows;
 }
 
-const TEXT_PADDING = 16; // spacingLeft + spacingRight у строки
-const WIDTH_SLACK = 6;   // запас, чтобы текст не упирался в край
+function commentRow(text) {
+  return { column: null, label: text, style: COMMENT_STYLE, height: NOTE_HEIGHT, note: true };
+}
+
+// Значения перечисления — по строке; комментарий типа — под заголовком.
+function enumRows(en, opts) {
+  const rows = [];
+  if (opts.showComments && en.comment) rows.push(commentRow(en.comment));
+  for (const value of en.values) rows.push({ column: null, label: value, style: ROW_STYLE, height: ROW_HEIGHT });
+  return rows;
+}
+
+// ------------------------------------------------------ узлы и связи схемы
+//
+// Узлы диаграммы: таблицы, представления и перечисления. Ключ узла (name) — имя таблицы
+// или представления, для перечисления — «enum:имя» (у типов своё пространство имён).
+// Связи для раскладки и трассировки: внешние ключи (kind 'fk'), колонка → её ENUM
+// ('enum', от блока перечисления к строке колонки) и таблица → представление ('view').
+
+const enumKey = name => 'enum:' + name;
+
+function schemaGraph(model, opts) {
+  const nodes = [];
+  for (const t of model.tables) {
+    const kind = t.kind || 'table';
+    if (kind !== 'table' && !opts.showViews) continue;
+    nodes.push({
+      name: t.name,
+      kind,
+      title: kind === 'table' ? t.name : `${t.name} (${kind})`,
+      table: t,
+      rows: buildRows(t, opts)
+    });
+  }
+  if (opts.showEnums) {
+    for (const en of model.enums || []) {
+      nodes.push({ name: enumKey(en.name), kind: 'enum', title: '«enum» ' + en.name, table: en, rows: enumRows(en, opts) });
+    }
+  }
+
+  const has = new Set(nodes.map(n => n.name));
+  const relations = model.relations
+    .filter(r => has.has(r.parent) && has.has(r.child))
+    .map(r => Object.assign({ kind: 'fk' }, r));
+  for (const l of model.enumLinks || []) {
+    const key = enumKey(l.enum);
+    if (has.has(key) && has.has(l.table)) {
+      relations.push({ kind: 'enum', parent: key, parentColumn: null, child: l.table, childColumn: l.column });
+    }
+  }
+  for (const d of model.viewDeps || []) {
+    if (has.has(d.table) && has.has(d.view)) {
+      relations.push({ kind: 'view', parent: d.table, parentColumn: null, child: d.view, childColumn: null });
+    }
+  }
+  return { nodes, relations };
+}
+
+const TEXT_PADDING = 20; // spacingLeft + spacingRight у строки + внутренний отступ текста draw.io (2 + 2)
+const WIDTH_SLACK = 8;   // запас: курсив и жирный рисуются чуть шире, чем измеряются
 const WRAP_WASTE = 0.9;  // при переносе по словам строка заполняется не до конца
 
 // Ширина текста строки: в draw.io плагин передаёт точное измерение (opts.measureText),
@@ -1111,8 +1459,8 @@ function rowTextWidth(row, measure) {
 }
 
 // Ширина таблицы; строки, которые в неё не влезли, переносятся — считаем их высоту и Y.
-function sizeRows(table, rows, measure) {
-  const widest = Math.max(measure(table.name, 12, true) + 40,
+function sizeRows(title, rows, measure) {
+  const widest = Math.max(measure(title, 12, true) + 40,
     ...rows.map(r => rowTextWidth(r, measure) + TEXT_PADDING + WIDTH_SLACK));
   const width = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.ceil(widest / 10) * 10));
   const available = width - TEXT_PADDING;
@@ -1180,8 +1528,8 @@ function computeLevels(tables, relations) {
   return { level, parents, children };
 }
 
-function layout(model, opts) {
-  const { tables, relations } = model;
+function layout(graph, opts) {
+  const { nodes: tables, relations } = graph;
   const { level, parents, children } = computeLevels(tables, relations);
 
   const connected = new Set();
@@ -1192,9 +1540,8 @@ function layout(model, opts) {
 
   const boxes = new Map();
   for (const t of tables) {
-    const rows = buildRows(t, opts);
-    const { width, height } = sizeRows(t, rows, opts.measureText || estimateTextWidth);
-    boxes.set(t.name, { table: t, rows, width, height, x: 0, y: 0 });
+    const { width, height } = sizeRows(t.title, t.rows, opts.measureText || estimateTextWidth);
+    boxes.set(t.name, { node: t, rows: t.rows, width, height, x: 0, y: 0 });
   }
 
   // Столбцы по уровням; таблицы без связей — отдельным столбцом в конце.
@@ -1271,7 +1618,7 @@ function layout(model, opts) {
   best.forEach((names, i) => names.forEach(n => columnOf.set(n, i)));
   const rowCenter = (table, column) => {
     const box = boxes.get(table);
-    const row = box.rows.find(r => r.column === column);
+    const row = column == null ? null : box.rows.find(r => r.column === column);
     return box.y + (row ? row.y + row.height / 2 : box.height / 2);
   };
   const lanes = planLanes(buildLinks(relations, rowCenter), columnOf);
@@ -1302,7 +1649,8 @@ function buildLinks(relations, rowCenter) {
       childColumn: pair.childColumn,
       from: rel.parent,
       to: rel.child,
-      key: rel.parent + '\u0000' + pair.parentColumn,
+      kind: rel.kind || 'fk',
+      key: rel.parent + '\u0000' + (pair.parentColumn == null ? '' : pair.parentColumn),
       sy: rowCenter(rel.parent, pair.parentColumn),
       ty: rowCenter(rel.child, pair.childColumn)
     }));
@@ -1325,9 +1673,15 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function vertex(id, parent, value, style, x, y, w, h) {
-  return `<mxCell id="${id}" value="${escapeXml(escapeHtml(value))}" style="${escapeXml(style)}" vertex="1" parent="${parent}">` +
-    `<mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry"/></mxCell>`;
+function vertex(id, parent, value, style, x, y, w, h, tooltip) {
+  const geometry = `<mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry"/>`;
+  const label = escapeXml(escapeHtml(value));
+  if (tooltip) {
+    // Подсказка при наведении — атрибут tooltip у UserObject (так её хранит draw.io).
+    return `<UserObject label="${label}" tooltip="${escapeXml(tooltip)}" id="${id}">` +
+      `<mxCell style="${escapeXml(style)}" vertex="1" parent="${parent}">${geometry}</mxCell></UserObject>`;
+  }
+  return `<mxCell id="${id}" value="${label}" style="${escapeXml(style)}" vertex="1" parent="${parent}">${geometry}</mxCell>`;
 }
 
 // Основная линия — значки «вороньей лапки»; дополнительная (часть составного ключа) —
@@ -1335,6 +1689,10 @@ function vertex(id, parent, value, style, x, y, w, h) {
 // sqlErLink=1 — метка «наша связь» для команды «Перепроложить связи».
 function linkStyle(link) {
   const common = 'edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;jumpStyle=arc;jumpSize=8;sqlErLink=1;';
+  // Колонка → её ENUM: тонкий пунктир без значков.
+  if (link.kind === 'enum') return common + 'dashed=1;dashPattern=2 3;startArrow=none;endArrow=none;opacity=60;';
+  // Таблица → представление: пунктир со стрелкой «данные идут сюда».
+  if (link.kind === 'view') return common + 'dashed=1;dashPattern=6 4;startArrow=none;endArrow=open;endSize=8;opacity=70;';
   if (!link.primary) return common + 'dashed=1;dashPattern=4 3;startArrow=none;endArrow=none;opacity=70;';
   const start = link.rel.optional ? 'ERzeroToOne' : 'ERmandOne';
   const end = link.rel.oneToOne ? 'ERzeroToOne' : 'ERmany';
@@ -1359,10 +1717,11 @@ function pointsXml(points) {
 
 function toGraphModelXml(model, options) {
   const opts = Object.assign({}, DEFAULTS, options);
-  const { boxes, rowCenter } = layout(model, opts);
+  const graph = schemaGraph(model, opts);
+  const { boxes, rowCenter } = layout(graph, opts);
 
-  const links = buildLinks(model.relations, rowCenter);
-  const obstacles = [...boxes.values()].map(b => ({ id: b.table.name, x: b.x, y: b.y, width: b.width, height: b.height }));
+  const links = buildLinks(graph.relations, rowCenter);
+  const obstacles = [...boxes.values()].map(b => ({ id: b.node.name, x: b.x, y: b.y, width: b.width, height: b.height }));
   const routes = routeLinks(links, obstacles);
 
   const cells = ['<mxCell id="0"/>', '<mxCell id="1" parent="0"/>'];
@@ -1372,20 +1731,21 @@ function toGraphModelXml(model, options) {
   let t = 0;
   for (const box of boxes.values()) {
     const tableId = 'sqler-t' + t++;
-    tableIds.set(box.table.name, tableId);
-    // sqlErName — имя таблицы для режима «Обновить» (подпись пользователь может поменять).
-    const tableStyle = TABLE_STYLE + 'sqlErName=' + encodeURIComponent(box.table.name) + ';';
-    cells.push(vertex(tableId, '1', box.table.name, tableStyle, box.x, box.y, box.width, box.height));
+    const node = box.node;
+    tableIds.set(node.name, tableId);
+    // sqlErName — ключ узла для режима «Обновить» (подпись пользователь может поменять).
+    const nodeStyle = NODE_STYLES[node.kind] + 'sqlErName=' + encodeURIComponent(node.name) + ';';
+    cells.push(vertex(tableId, '1', node.title, nodeStyle, box.x, box.y, box.width, box.height));
     box.rows.forEach((row, i) => {
       const rowId = tableId + '-r' + i;
-      if (row.column) rowIds.set(box.table.name + '\u0000' + row.column, rowId);
-      cells.push(vertex(rowId, tableId, row.label, row.style, 0, row.y, box.width, row.height));
+      if (row.column) rowIds.set(node.name + '\u0000' + row.column, rowId);
+      cells.push(vertex(rowId, tableId, row.label, row.style, 0, row.y, box.width, row.height, row.tooltip));
     });
   }
 
   links.forEach((link, i) => {
-    const source = rowIds.get(link.from + '\u0000' + link.parentColumn) || tableIds.get(link.from);
-    const target = rowIds.get(link.to + '\u0000' + link.childColumn) || tableIds.get(link.to);
+    const source = (link.parentColumn != null && rowIds.get(link.from + '\u0000' + link.parentColumn)) || tableIds.get(link.from);
+    const target = (link.childColumn != null && rowIds.get(link.to + '\u0000' + link.childColumn)) || tableIds.get(link.to);
     if (!source || !target) return;
     const route = routes[i];
     const style = linkStyle(link) + sideStyle(route);
@@ -1396,7 +1756,7 @@ function toGraphModelXml(model, options) {
   return `<mxGraphModel><root>${cells.join('')}</root></mxGraphModel>`;
 }
 
-module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle };
+module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle, schemaGraph, DEFAULTS };
 
   };
 
@@ -1408,7 +1768,7 @@ module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle };
 //   - «Обновить» — привести диаграмму к новой схеме, не двигая существующие таблицы.
 // Таблицы плагина помечены в стиле sqlErTable=1 (и sqlErName=<имя>), связи — sqlErLink=1.
 
-const { toGraphModelXml, sideStyle } = require('./drawio');
+const { toGraphModelXml, sideStyle, schemaGraph, DEFAULTS } = require('./drawio');
 const { routeLinks } = require('./routing');
 const { placeNewTables } = require('./placement');
 const { selectTables } = require('./select');
@@ -1539,6 +1899,9 @@ function updatePage(ui, fullSchema, opts, selected) {
   const wanted = new Set(selected || inSchema);
   for (const name of pageTables.keys()) if (inSchema.has(name)) wanted.add(name);
   const schema = selectTables(fullSchema, [...wanted]);
+  // Всё, что есть в схеме (таблицы, представления, ENUM). Узел на странице, которого
+  // здесь нет, — удалён из схемы; есть, но скрыт галочками/выбором — не трогаем.
+  const known = new Set([...inSchema, ...(fullSchema.enums || []).map(e => 'enum:' + e.name)]);
 
   // Свежая диаграмма по новой схеме — из неё берём строки, размеры и связи.
   const doc = mxUtils.parseXml(toGraphModelXml(schema, opts));
@@ -1563,7 +1926,8 @@ function updatePage(ui, fullSchema, opts, selected) {
   const incoming = [...freshTables]
     .filter(([name]) => !pageTables.has(name))
     .map(([name, cell]) => ({ name, width: fresh.getGeometry(cell).width, height: fresh.getGeometry(cell).height }));
-  const positions = placeNewTables(existing, incoming, schema.relations);
+  // Места — по всем связям схемы: внешние ключи, колонка → ENUM, таблица → представление.
+  const positions = placeNewTables(existing, incoming, schemaGraph(schema, Object.assign({}, DEFAULTS, opts)).relations);
 
   const summary = { updated: 0, added: 0, removed: 0, restored: 0, links: 0 };
   const result = new Map(); // имя → таблица на странице
@@ -1615,7 +1979,7 @@ function updatePage(ui, fullSchema, opts, selected) {
 
     // Таблицы, которых нет в новой схеме, — пометить, не удалять.
     for (const [name, table] of pageTables) {
-      if (freshTables.has(name) || hasFlag(model.getStyle(table), 'sqlErRemoved')) continue;
+      if (freshTables.has(name) || known.has(name) || hasFlag(model.getStyle(table), 'sqlErRemoved')) continue;
       model.setStyle(table, markRemoved(model.getStyle(table)));
       summary.removed++;
     }
@@ -1929,7 +2293,10 @@ function showDialog(ui) {
     const model = parseSql(textarea.value);
     picker.setSchema(model);
     const indexes = model.tables.reduce((n, t) => n + t.indexes.length, 0);
-    let text = `Таблиц: ${model.tables.length}, связей: ${model.relations.length}, индексов: ${indexes}`;
+    const views = model.tables.filter(t => t.kind && t.kind !== 'table').length;
+    let text = `Таблиц: ${model.tables.length - views}, связей: ${model.relations.length}, индексов: ${indexes}`;
+    if (views) text += `, представлений: ${views}`;
+    if (model.enums && model.enums.length) text += `, ENUM: ${model.enums.length}`;
     const warnings = sourceWarnings.concat(model.warnings);
     if (warnings.length) text += '\n⚠ ' + warnings.join('\n⚠ ');
     status.textContent = text;
@@ -2012,6 +2379,9 @@ function showDialog(ui) {
   const detailBox = checkbox(options, 'Ограничения как в SQL', true);
   const nullableBox = checkbox(options, 'Показывать NULL', true);
   const indexesBox = checkbox(options, 'Показывать индексы', true);
+  const enumsBox = checkbox(options, 'ENUM', true);
+  const viewsBox = checkbox(options, 'Представления', true);
+  const commentsBox = checkbox(options, 'Комментарии', true);
   // «NULL» — метка короткого режима; в режиме SQL видно, есть ли NOT NULL.
   const syncNullable = () => {
     nullableBox.disabled = detailBox.checked;
@@ -2042,6 +2412,9 @@ function showDialog(ui) {
     detail: detailBox.checked ? 'sql' : 'tags',
     showNullable: nullableBox.checked,
     showIndexes: indexesBox.checked,
+    showEnums: enumsBox.checked,
+    showViews: viewsBox.checked,
+    showComments: commentsBox.checked,
     measureText
   });
 

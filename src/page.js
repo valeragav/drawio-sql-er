@@ -5,7 +5,7 @@
 //   - «Обновить» — привести диаграмму к новой схеме, не двигая существующие таблицы.
 // Таблицы плагина помечены в стиле sqlErTable=1 (и sqlErName=<имя>), связи — sqlErLink=1.
 
-const { toGraphModelXml, sideStyle } = require('./drawio');
+const { toGraphModelXml, sideStyle, schemaGraph, DEFAULTS } = require('./drawio');
 const { routeLinks } = require('./routing');
 const { placeNewTables } = require('./placement');
 const { selectTables } = require('./select');
@@ -136,6 +136,9 @@ function updatePage(ui, fullSchema, opts, selected) {
   const wanted = new Set(selected || inSchema);
   for (const name of pageTables.keys()) if (inSchema.has(name)) wanted.add(name);
   const schema = selectTables(fullSchema, [...wanted]);
+  // Всё, что есть в схеме (таблицы, представления, ENUM). Узел на странице, которого
+  // здесь нет, — удалён из схемы; есть, но скрыт галочками/выбором — не трогаем.
+  const known = new Set([...inSchema, ...(fullSchema.enums || []).map(e => 'enum:' + e.name)]);
 
   // Свежая диаграмма по новой схеме — из неё берём строки, размеры и связи.
   const doc = mxUtils.parseXml(toGraphModelXml(schema, opts));
@@ -160,7 +163,8 @@ function updatePage(ui, fullSchema, opts, selected) {
   const incoming = [...freshTables]
     .filter(([name]) => !pageTables.has(name))
     .map(([name, cell]) => ({ name, width: fresh.getGeometry(cell).width, height: fresh.getGeometry(cell).height }));
-  const positions = placeNewTables(existing, incoming, schema.relations);
+  // Места — по всем связям схемы: внешние ключи, колонка → ENUM, таблица → представление.
+  const positions = placeNewTables(existing, incoming, schemaGraph(schema, Object.assign({}, DEFAULTS, opts)).relations);
 
   const summary = { updated: 0, added: 0, removed: 0, restored: 0, links: 0 };
   const result = new Map(); // имя → таблица на странице
@@ -212,7 +216,7 @@ function updatePage(ui, fullSchema, opts, selected) {
 
     // Таблицы, которых нет в новой схеме, — пометить, не удалять.
     for (const [name, table] of pageTables) {
-      if (freshTables.has(name) || hasFlag(model.getStyle(table), 'sqlErRemoved')) continue;
+      if (freshTables.has(name) || known.has(name) || hasFlag(model.getStyle(table), 'sqlErRemoved')) continue;
       model.setStyle(table, markRemoved(model.getStyle(table)));
       summary.removed++;
     }

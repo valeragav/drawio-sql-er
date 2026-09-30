@@ -164,7 +164,8 @@ test('комментарии, вложенные /* */ и прочие инст�
     CREATE TABLE t (a INT);
     CREATE VIEW v AS SELECT 1;
   `);
-  assert.deepEqual(m.tables.map(t => t.name), ['t']);
+  assert.deepEqual(m.tables.filter(t => t.kind === 'table').map(t => t.name), ['t']);
+  assert.deepEqual(m.tables.filter(t => t.kind === 'view').map(t => t.name), ['v']);
 });
 
 test('пример examples/shop.sql', () => {

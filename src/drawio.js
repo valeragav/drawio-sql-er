@@ -3,6 +3,8 @@
 // Модель из parser.js → XML графа draw.io (mxGraphModel).
 // Таблица — swimlane со стек-раскладкой, каждая колонка — отдельная строка-ячейка,
 // связи соединяют строки (PK родителя → FK ребёнка) в нотации «воронья лапка».
+// Представления — такие же блоки с пунктирной рамкой (стрелки от таблиц из FROM/JOIN),
+// перечисления (ENUM) — блоки со значениями (пунктир к колонкам этого типа).
 
 const { planLanes, gapWidth, routeLinks } = require('./routing');
 
@@ -27,6 +29,11 @@ const ROW_STYLE =
   'rotatable=0;points=[[0,0.5],[1,0.5]];portConstraint=eastwest;html=1;';
 
 const NOTE_STYLE = ROW_STYLE + 'fontSize=11;textOpacity=60;';
+const COMMENT_STYLE = NOTE_STYLE + 'fontStyle=2;';
+
+const VIEW_STYLE = TABLE_STYLE + 'dashed=1;dashPattern=8 4;';
+const ENUM_STYLE = TABLE_STYLE.replace('fontStyle=1;', 'fontStyle=3;') + 'rounded=1;arcSize=6;';
+const NODE_STYLES = { table: TABLE_STYLE, view: VIEW_STYLE, 'materialized view': VIEW_STYLE, enum: ENUM_STYLE };
 const NOTE_HEIGHT = 20;
 
 // Разделитель между колонками и блоком индексов/ограничений (как в ER-фигурах draw.io).
@@ -38,6 +45,9 @@ const DIVIDER_HEIGHT = 8;
 const DEFAULTS = {
   showNullable: true,
   showIndexes: true,
+  showEnums: true,
+  showViews: true,
+  showComments: true,
   detail: 'sql',
   x: 0,
   y: 0
@@ -85,12 +95,21 @@ function indexLabel(index) {
 // Строки таблицы: колонки, затем (через разделитель) составные UNIQUE и индексы.
 // y — смещение строки от верха таблицы.
 function buildRows(table, opts) {
-  const rows = table.columns.map(col => ({
-    column: col.name,
-    label: columnLabel(col, opts),
-    style: ROW_STYLE + (fontStyle(col) ? 'fontStyle=' + fontStyle(col) + ';' : ''),
-    height: ROW_HEIGHT
-  }));
+  const rows = [];
+  // COMMENT ON TABLE — мелкой строкой сразу под заголовком.
+  if (opts.showComments && table.comment) rows.push(commentRow(table.comment));
+
+  for (const col of table.columns) {
+    // COMMENT ON COLUMN — всплывающей подсказкой; значок 💬 показывает, что она есть.
+    const comment = opts.showComments && col.comment ? col.comment : null;
+    rows.push({
+      column: col.name,
+      label: columnLabel(col, opts) + (comment ? ' 💬' : ''),
+      tooltip: comment,
+      style: ROW_STYLE + (fontStyle(col) ? 'fontStyle=' + fontStyle(col) + ';' : ''),
+      height: ROW_HEIGHT
+    });
+  }
 
   const notes = opts.detail === 'tags'
     ? (table.compositeUniques || []).map(cols => 'UNIQUE (' + cols.join(', ') + ')')
@@ -103,8 +122,66 @@ function buildRows(table, opts) {
   return rows;
 }
 
-const TEXT_PADDING = 16; // spacingLeft + spacingRight у строки
-const WIDTH_SLACK = 6;   // запас, чтобы текст не упирался в край
+function commentRow(text) {
+  return { column: null, label: text, style: COMMENT_STYLE, height: NOTE_HEIGHT, note: true };
+}
+
+// Значения перечисления — по строке; комментарий типа — под заголовком.
+function enumRows(en, opts) {
+  const rows = [];
+  if (opts.showComments && en.comment) rows.push(commentRow(en.comment));
+  for (const value of en.values) rows.push({ column: null, label: value, style: ROW_STYLE, height: ROW_HEIGHT });
+  return rows;
+}
+
+// ------------------------------------------------------ узлы и связи схемы
+//
+// Узлы диаграммы: таблицы, представления и перечисления. Ключ узла (name) — имя таблицы
+// или представления, для перечисления — «enum:имя» (у типов своё пространство имён).
+// Связи для раскладки и трассировки: внешние ключи (kind 'fk'), колонка → её ENUM
+// ('enum', от блока перечисления к строке колонки) и таблица → представление ('view').
+
+const enumKey = name => 'enum:' + name;
+
+function schemaGraph(model, opts) {
+  const nodes = [];
+  for (const t of model.tables) {
+    const kind = t.kind || 'table';
+    if (kind !== 'table' && !opts.showViews) continue;
+    nodes.push({
+      name: t.name,
+      kind,
+      title: kind === 'table' ? t.name : `${t.name} (${kind})`,
+      table: t,
+      rows: buildRows(t, opts)
+    });
+  }
+  if (opts.showEnums) {
+    for (const en of model.enums || []) {
+      nodes.push({ name: enumKey(en.name), kind: 'enum', title: '«enum» ' + en.name, table: en, rows: enumRows(en, opts) });
+    }
+  }
+
+  const has = new Set(nodes.map(n => n.name));
+  const relations = model.relations
+    .filter(r => has.has(r.parent) && has.has(r.child))
+    .map(r => Object.assign({ kind: 'fk' }, r));
+  for (const l of model.enumLinks || []) {
+    const key = enumKey(l.enum);
+    if (has.has(key) && has.has(l.table)) {
+      relations.push({ kind: 'enum', parent: key, parentColumn: null, child: l.table, childColumn: l.column });
+    }
+  }
+  for (const d of model.viewDeps || []) {
+    if (has.has(d.table) && has.has(d.view)) {
+      relations.push({ kind: 'view', parent: d.table, parentColumn: null, child: d.view, childColumn: null });
+    }
+  }
+  return { nodes, relations };
+}
+
+const TEXT_PADDING = 20; // spacingLeft + spacingRight у строки + внутренний отступ текста draw.io (2 + 2)
+const WIDTH_SLACK = 8;   // запас: курсив и жирный рисуются чуть шире, чем измеряются
 const WRAP_WASTE = 0.9;  // при переносе по словам строка заполняется не до конца
 
 // Ширина текста строки: в draw.io плагин передаёт точное измерение (opts.measureText),
@@ -114,8 +191,8 @@ function rowTextWidth(row, measure) {
 }
 
 // Ширина таблицы; строки, которые в неё не влезли, переносятся — считаем их высоту и Y.
-function sizeRows(table, rows, measure) {
-  const widest = Math.max(measure(table.name, 12, true) + 40,
+function sizeRows(title, rows, measure) {
+  const widest = Math.max(measure(title, 12, true) + 40,
     ...rows.map(r => rowTextWidth(r, measure) + TEXT_PADDING + WIDTH_SLACK));
   const width = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.ceil(widest / 10) * 10));
   const available = width - TEXT_PADDING;
@@ -183,8 +260,8 @@ function computeLevels(tables, relations) {
   return { level, parents, children };
 }
 
-function layout(model, opts) {
-  const { tables, relations } = model;
+function layout(graph, opts) {
+  const { nodes: tables, relations } = graph;
   const { level, parents, children } = computeLevels(tables, relations);
 
   const connected = new Set();
@@ -195,9 +272,8 @@ function layout(model, opts) {
 
   const boxes = new Map();
   for (const t of tables) {
-    const rows = buildRows(t, opts);
-    const { width, height } = sizeRows(t, rows, opts.measureText || estimateTextWidth);
-    boxes.set(t.name, { table: t, rows, width, height, x: 0, y: 0 });
+    const { width, height } = sizeRows(t.title, t.rows, opts.measureText || estimateTextWidth);
+    boxes.set(t.name, { node: t, rows: t.rows, width, height, x: 0, y: 0 });
   }
 
   // Столбцы по уровням; таблицы без связей — отдельным столбцом в конце.
@@ -274,7 +350,7 @@ function layout(model, opts) {
   best.forEach((names, i) => names.forEach(n => columnOf.set(n, i)));
   const rowCenter = (table, column) => {
     const box = boxes.get(table);
-    const row = box.rows.find(r => r.column === column);
+    const row = column == null ? null : box.rows.find(r => r.column === column);
     return box.y + (row ? row.y + row.height / 2 : box.height / 2);
   };
   const lanes = planLanes(buildLinks(relations, rowCenter), columnOf);
@@ -305,7 +381,8 @@ function buildLinks(relations, rowCenter) {
       childColumn: pair.childColumn,
       from: rel.parent,
       to: rel.child,
-      key: rel.parent + '\u0000' + pair.parentColumn,
+      kind: rel.kind || 'fk',
+      key: rel.parent + '\u0000' + (pair.parentColumn == null ? '' : pair.parentColumn),
       sy: rowCenter(rel.parent, pair.parentColumn),
       ty: rowCenter(rel.child, pair.childColumn)
     }));
@@ -328,9 +405,15 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function vertex(id, parent, value, style, x, y, w, h) {
-  return `<mxCell id="${id}" value="${escapeXml(escapeHtml(value))}" style="${escapeXml(style)}" vertex="1" parent="${parent}">` +
-    `<mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry"/></mxCell>`;
+function vertex(id, parent, value, style, x, y, w, h, tooltip) {
+  const geometry = `<mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry"/>`;
+  const label = escapeXml(escapeHtml(value));
+  if (tooltip) {
+    // Подсказка при наведении — атрибут tooltip у UserObject (так её хранит draw.io).
+    return `<UserObject label="${label}" tooltip="${escapeXml(tooltip)}" id="${id}">` +
+      `<mxCell style="${escapeXml(style)}" vertex="1" parent="${parent}">${geometry}</mxCell></UserObject>`;
+  }
+  return `<mxCell id="${id}" value="${label}" style="${escapeXml(style)}" vertex="1" parent="${parent}">${geometry}</mxCell>`;
 }
 
 // Основная линия — значки «вороньей лапки»; дополнительная (часть составного ключа) —
@@ -338,6 +421,10 @@ function vertex(id, parent, value, style, x, y, w, h) {
 // sqlErLink=1 — метка «наша связь» для команды «Перепроложить связи».
 function linkStyle(link) {
   const common = 'edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;jumpStyle=arc;jumpSize=8;sqlErLink=1;';
+  // Колонка → её ENUM: тонкий пунктир без значков.
+  if (link.kind === 'enum') return common + 'dashed=1;dashPattern=2 3;startArrow=none;endArrow=none;opacity=60;';
+  // Таблица → представление: пунктир со стрелкой «данные идут сюда».
+  if (link.kind === 'view') return common + 'dashed=1;dashPattern=6 4;startArrow=none;endArrow=open;endSize=8;opacity=70;';
   if (!link.primary) return common + 'dashed=1;dashPattern=4 3;startArrow=none;endArrow=none;opacity=70;';
   const start = link.rel.optional ? 'ERzeroToOne' : 'ERmandOne';
   const end = link.rel.oneToOne ? 'ERzeroToOne' : 'ERmany';
@@ -362,10 +449,11 @@ function pointsXml(points) {
 
 function toGraphModelXml(model, options) {
   const opts = Object.assign({}, DEFAULTS, options);
-  const { boxes, rowCenter } = layout(model, opts);
+  const graph = schemaGraph(model, opts);
+  const { boxes, rowCenter } = layout(graph, opts);
 
-  const links = buildLinks(model.relations, rowCenter);
-  const obstacles = [...boxes.values()].map(b => ({ id: b.table.name, x: b.x, y: b.y, width: b.width, height: b.height }));
+  const links = buildLinks(graph.relations, rowCenter);
+  const obstacles = [...boxes.values()].map(b => ({ id: b.node.name, x: b.x, y: b.y, width: b.width, height: b.height }));
   const routes = routeLinks(links, obstacles);
 
   const cells = ['<mxCell id="0"/>', '<mxCell id="1" parent="0"/>'];
@@ -375,20 +463,21 @@ function toGraphModelXml(model, options) {
   let t = 0;
   for (const box of boxes.values()) {
     const tableId = 'sqler-t' + t++;
-    tableIds.set(box.table.name, tableId);
-    // sqlErName — имя таблицы для режима «Обновить» (подпись пользователь может поменять).
-    const tableStyle = TABLE_STYLE + 'sqlErName=' + encodeURIComponent(box.table.name) + ';';
-    cells.push(vertex(tableId, '1', box.table.name, tableStyle, box.x, box.y, box.width, box.height));
+    const node = box.node;
+    tableIds.set(node.name, tableId);
+    // sqlErName — ключ узла для режима «Обновить» (подпись пользователь может поменять).
+    const nodeStyle = NODE_STYLES[node.kind] + 'sqlErName=' + encodeURIComponent(node.name) + ';';
+    cells.push(vertex(tableId, '1', node.title, nodeStyle, box.x, box.y, box.width, box.height));
     box.rows.forEach((row, i) => {
       const rowId = tableId + '-r' + i;
-      if (row.column) rowIds.set(box.table.name + '\u0000' + row.column, rowId);
-      cells.push(vertex(rowId, tableId, row.label, row.style, 0, row.y, box.width, row.height));
+      if (row.column) rowIds.set(node.name + '\u0000' + row.column, rowId);
+      cells.push(vertex(rowId, tableId, row.label, row.style, 0, row.y, box.width, row.height, row.tooltip));
     });
   }
 
   links.forEach((link, i) => {
-    const source = rowIds.get(link.from + '\u0000' + link.parentColumn) || tableIds.get(link.from);
-    const target = rowIds.get(link.to + '\u0000' + link.childColumn) || tableIds.get(link.to);
+    const source = (link.parentColumn != null && rowIds.get(link.from + '\u0000' + link.parentColumn)) || tableIds.get(link.from);
+    const target = (link.childColumn != null && rowIds.get(link.to + '\u0000' + link.childColumn)) || tableIds.get(link.to);
     if (!source || !target) return;
     const route = routes[i];
     const style = linkStyle(link) + sideStyle(route);
@@ -399,4 +488,4 @@ function toGraphModelXml(model, options) {
   return `<mxGraphModel><root>${cells.join('')}</root></mxGraphModel>`;
 }
 
-module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle };
+module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle, schemaGraph, DEFAULTS };
