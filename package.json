@@ -6,13 +6,13 @@
   "license": "MIT",
   "scripts": {
     "build": "node scripts/build.js",
-    "start": "node scripts/build.js && node scripts/start-drawio.js",
-    "serve": "node scripts/build.js && node scripts/server.js",
+    "start": "node scripts/build.js && node --env-file-if-exists=.env scripts/start-drawio.js",
+    "serve": "node scripts/build.js && node --env-file-if-exists=.env scripts/server.js",
     "test": "node --test",
     "check": "node scripts/check.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.9"
   },
   "dependencies": {
     "pg": "^8.23.0"

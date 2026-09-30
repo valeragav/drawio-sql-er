@@ -11,10 +11,11 @@
 //
 //   node scripts/start-drawio.js [файл.drawio]
 
-// Встроенный WebSocket (соединение с окном draw.io) есть в Node.js начиная с 22.
-const NODE_MAJOR = Number(process.versions.node.split('.')[0]);
-if (NODE_MAJOR < 22 || typeof WebSocket !== 'function') {
-  console.error(`Нужен Node.js 22 или новее (сейчас ${process.version}). Скачайте: https://nodejs.org`);
+// Встроенный WebSocket (соединение с окном draw.io) — с Node.js 22, чтение .env
+// (--env-file-if-exists в npm start) — с 22.9.
+const [NODE_MAJOR, NODE_MINOR] = process.versions.node.split('.').map(Number);
+if (NODE_MAJOR < 22 || (NODE_MAJOR === 22 && NODE_MINOR < 9) || typeof WebSocket !== 'function') {
+  console.error(`Нужен Node.js 22.9 или новее (сейчас ${process.version}). Скачайте: https://nodejs.org`);
   process.exit(1);
 }
 

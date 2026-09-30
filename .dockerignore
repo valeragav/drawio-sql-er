@@ -9,3 +9,5 @@ examples
 Dockerfile
 docker-compose.yml
 .dockerignore
+.env
+.env.*
