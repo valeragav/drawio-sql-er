@@ -1,0 +1,114 @@
+# Выпуск по тегу v*: проверка → GitHub Release с файлом плагина → образ в ghcr.io.
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# Версия в теге должна совпадать с package.json, а в CHANGELOG.md должен быть раздел
+# «## 1.0.0 — …» — его текст становится описанием выпуска.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - name: версия тега = package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::тег $GITHUB_REF_NAME, а в package.json $pkg"
+            exit 1
+          fi
+
+  release:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm run build
+      - name: описание из CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # раздел от «## <версия>» до следующего «## »
+          awk -v v="$version" '
+            /^## / { if (found) exit; if (index($0, "## " v " ") == 1 || $0 == "## " v) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::в CHANGELOG.md нет раздела ## $version"
+            exit 1
+          fi
+          cat >> notes.md <<EOF
+
+          ### Установка
+
+          Docker (amd64, arm64):
+
+          \`\`\`sh
+          docker run -d -p 127.0.0.1:8080:8080 --add-host=host.docker.internal:host-gateway ghcr.io/${GITHUB_REPOSITORY,,}:$version
+          \`\`\`
+
+          Сайт app.diagrams.net: скачайте \`sql-er-plugin.js\` ниже, откройте его, скопируйте всё
+          и вставьте в консоль браузера (F12 → Console) — подробнее в docs/setup.md.
+          EOF
+      - name: выпуск с файлом плагина
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum sql-er-plugin.js > sql-er-plugin.js.sha256
+          gh release create "$GITHUB_REF_NAME" sql-er-plugin.js sql-er-plugin.js.sha256 \
+            --title "$GITHUB_REF_NAME" --notes-file ../notes.md --verify-tag
+
+  image:
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # v1.2.3 → 1.2.3, 1.2, latest
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=drawio-sql-er
+            org.opencontainers.image.description=draw.io с плагином SQL → ER-диаграмма
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

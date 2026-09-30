@@ -40,24 +40,27 @@ draw.io: их можно двигать, править и сохранять к
 
 ## Быстрый старт
 
-**Docker**, draw.io с плагином в браузере:
+**Docker**, draw.io с плагином в браузере, одной командой:
 
 ```sh
-git clone https://github.com/valeragav/drawio-sql-er.git
-cd drawio-sql-er
-docker compose up -d        # → http://localhost:8080
+docker run -d --name drawio-sql-er -p 127.0.0.1:8080:8080 \
+  --add-host=host.docker.internal:host-gateway ghcr.io/valeragav/drawio-sql-er
+# → http://localhost:8080
 ```
 
 **draw.io Desktop** (нужен Node.js 22.9+):
 
 ```sh
+git clone https://github.com/valeragav/drawio-sql-er.git
+cd drawio-sql-er
 npm install
 npm start                   # терминал не закрывать, пока работаете
 ```
 
-**Без установки**: на [app.diagrams.net](https://app.diagrams.net/) плагин вставляется в
-консоль браузера ([инструкция](docs/setup.md#сайт-appdiagramsnet)). Подключения к базе
-там нет.
+**Без установки**: скачайте `sql-er-plugin.js` из
+[последнего выпуска](https://github.com/valeragav/drawio-sql-er/releases/latest) и вставьте
+его в консоль браузера на [app.diagrams.net](https://app.diagrams.net/)
+([инструкция](docs/setup.md#сайт-appdiagramsnet)). Подключения к базе там нет.
 
 Затем: **Упорядочить → Вставить → «Из SQL (ER-диаграмма)…»**, вставьте SQL (например,
 [`examples/shop.sql`](examples/shop.sql)) и нажмите **«Вставить»**.

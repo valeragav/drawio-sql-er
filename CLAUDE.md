@@ -24,6 +24,13 @@ npm run serve   # сервер как в Docker, без Docker (нужен DRAWI
 docker compose up -d --build   # образ: draw.io 31.4.6 из jgraph/drawio + Node-сервер
 ```
 
+Выпуск: поднять `version` в package.json, переименовать «## Не выпущено» в CHANGELOG.md в
+«## X.Y.Z — дата», затем `git tag vX.Y.Z && git push origin vX.Y.Z`.
+`.github/workflows/release.yml` проверит, что тег совпадает с package.json и раздел есть, создаст
+GitHub Release (описание из CHANGELOG, `sql-er-plugin.js` + `.sha256`) и опубликует образ
+`ghcr.io/valeragav/drawio-sql-er` (amd64 + arm64; теги X.Y.Z, X.Y, latest).
+Пакет в ghcr после первой публикации приватный — сделать публичным в настройках пакета.
+
 ## Устройство
 
 ```

@@ -17,6 +17,7 @@
 |                     | Docker                              | draw.io Desktop                | app.diagrams.net                              |
 | ------------------- | ----------------------------------- | ------------------------------ | --------------------------------------------- |
 | Что нужно           | Docker                              | draw.io Desktop, Node.js 22.9+ | только браузер                                |
+| Установка           | одна команда `docker run`           | `git clone`, `npm install`     | скачать файл плагина                          |
 | Где работает        | `http://localhost:8080`             | окно draw.io Desktop           | https://app.diagrams.net/                     |
 | Плагин подключается | сам                                 | сам, через `npm start`         | вставкой в консоль, после каждой перезагрузки |
 | Подключение к базе  | через сервер в контейнере           | через мост в терминале         | нет                                           |
@@ -25,33 +26,47 @@
 Чтобы просто попробовать без установки, используйте **сайт**. Для постоянной работы в браузере
 подходит **Docker**, для работы с файлами `.drawio` на диске — **Desktop**.
 
-Для Docker и Desktop сначала скачайте проект:
-
-```sh
-git clone https://github.com/valeragav/drawio-sql-er.git
-cd drawio-sql-er
-```
-
 ## Docker
 
+Готовый образ лежит в GitHub Container Registry, собран для amd64 и arm64 (в том числе
+Mac на Apple Silicon). Клонировать проект не нужно:
+
 ```sh
-docker compose up -d
+docker run -d --name drawio-sql-er --restart unless-stopped   -p 127.0.0.1:8080:8080   --add-host=host.docker.internal:host-gateway   ghcr.io/valeragav/drawio-sql-er
 ```
 
 Откройте **http://localhost:8080**. Это draw.io 31.4.6 с уже подключённым плагином и сервером
 для подключения к базе, всё на одном адресе.
 
-- Остановить — `docker compose down`.
+- Остановить и удалить контейнер: `docker rm -f drawio-sql-er`.
 - Диаграммы сохраняются как обычно: *Файл → Сохранить* скачивает `.drawio`. Сервер ничего
   не хранит.
-- Порт и другие параметры задаются в [`.env`](#настройки-env).
-- База на этом же компьютере доступна из контейнера как `host.docker.internal`, подробнее —
-  в разделе [«Подключение к базе»](#подключение-к-базе).
+- `--add-host` нужен, чтобы база на этом же компьютере была доступна из контейнера как
+  `host.docker.internal` (см. [«Подключение к базе»](#подключение-к-базе)). В Docker Desktop
+  для Windows и macOS это имя работает и без него.
+- Другой порт: `-p 127.0.0.1:9000:8080`. Выключить подключение к базе: `-e SQL_ER_DB=off`.
+
+**Теги образа:** `latest` — последний выпуск, `1.0.0` — конкретная версия, `1.0` —
+последняя с исправлениями в этой ветке. Для постоянной работы лучше указывать версию:
+`ghcr.io/valeragav/drawio-sql-er:1.0.0`.
+
+### Docker Compose и сборка из исходников
+
+В репозитории есть `docker-compose.yml`: он собирает образ из текущих исходников и берёт
+настройки из [`.env`](#настройки-env). Подходит, если вы правите плагин или хотите
+управлять настройками файлом:
+
+```sh
+git clone https://github.com/valeragav/drawio-sql-er.git
+cd drawio-sql-er
+docker compose up -d --build   # остановить: docker compose down
+```
 
 ## draw.io Desktop
 
 Нужны:
 
+- проект: `git clone https://github.com/valeragav/drawio-sql-er.git`;
 - [draw.io Desktop](https://www.drawio.com/). Подходит обычная версия, а не версия из
   Microsoft Store, которая не принимает нужные флаги запуска. Установка через winget:
   `winget install JGraph.Draw`;
@@ -80,12 +95,18 @@ npm start
 Штатно (*Extras → Plugins*) сайт подключает только встроенные плагины, но плагин можно
 выполнить в консоли браузера.
 
-1. Соберите плагин и скопируйте его в буфер обмена (в папке проекта):
+1. Скачайте `sql-er-plugin.js` со страницы
+   [последнего выпуска](https://github.com/valeragav/drawio-sql-er/releases/latest), откройте
+   его в любом текстовом редакторе и скопируйте всё содержимое (Ctrl+A, Ctrl+C). Или из
+   командной строки:
    ```powershell
-   npm run build
-   Get-Content "dist\sql-er-plugin.js" -Raw -Encoding UTF8 | Set-Clipboard
+   Get-Content "sql-er-plugin.js" -Raw -Encoding UTF8 | Set-Clipboard
    ```
-   В macOS: `pbcopy < dist/sql-er-plugin.js`, в Linux: `xclip -sel clip < dist/sql-er-plugin.js`.
+   В macOS: `pbcopy < sql-er-plugin.js`, в Linux: `xclip -sel clip < sql-er-plugin.js`.
+
+   Из исходников файл собирается командой `npm run build` в `dist/sql-er-plugin.js`.
+   Рядом с файлом в выпуске лежит `sql-er-plugin.js.sha256`: по этой контрольной сумме
+   можно проверить, что файл скачался целиком.
 2. Откройте https://app.diagrams.net/, нажмите **F12** и перейдите на вкладку **Console**.
 3. Нажмите в консоли **Ctrl+V**, затем **Enter**.
    - Если вместо этого появилось жёлтое предупреждение «Don't paste code…» («Не вставляйте
@@ -125,16 +146,19 @@ cp .env.example .env
 
 | Переменная          | По умолчанию | Способ     | Для чего                                                         |
 | ------------------- | ------------ | ---------- | ---------------------------------------------------------------- |
-| `SQL_ER_PORT`       | `8080`       | Docker     | порт в браузере                                                  |
-| `SQL_ER_BIND`       | `127.0.0.1`  | Docker     | `0.0.0.0` открывает доступ из сети (только с HTTPS, см. ниже)    |
+| `SQL_ER_PORT`       | `8080`       | Compose    | порт в браузере                                                  |
+| `SQL_ER_BIND`       | `127.0.0.1`  | Compose    | `0.0.0.0` открывает доступ из сети (только с HTTPS, см. ниже)    |
 | `SQL_ER_DB`         | `on`         | Docker     | `off` выключает подключение к базе                               |
 | `DRAWIO_DIR`        | —            | serve      | папка с веб-версией draw.io (обязательна)                        |
 | `PORT`, `HOST`      | `8080`, `127.0.0.1` | serve | порт и адрес сервера                                          |
 | `DRAWIO_EXE`        | —            | Desktop    | путь к `draw.io.exe`, если он не нашёлся сам                     |
 | `DRAWIO_DEBUG_PORT` | `9339`       | Desktop    | служебный порт, через который подгружается плагин                |
 
-Чтобы изменения вступили в силу: в Docker выполните `docker compose up -d`, для Desktop
+Чтобы изменения вступили в силу: в Compose выполните `docker compose up -d`, для Desktop
 перезапустите `npm start`.
+
+С готовым образом (`docker run`) файл `.env` не нужен: порт и адрес задаются ключом `-p`
+(`-p 127.0.0.1:9000:8080`), остальное — ключом `-e` (`-e SQL_ER_DB=off`).
 
 ## Подключение к базе
 
@@ -183,7 +207,7 @@ cp .env.example .env
   списке подключений (`pg_stat_activity`) он виден как `drawio-sql-er`.
 - **Docker** по умолчанию доступен только с этого компьютера. Сервер подключается к той
   базе, которую укажет открывший страницу, и пароль передаётся ему в запросе. Поэтому,
-  открывая доступ коллегам (`SQL_ER_BIND=0.0.0.0`), ставьте впереди прокси с HTTPS и
+  открывая доступ коллегам (`SQL_ER_BIND=0.0.0.0` или `-p 8080:8080` без `127.0.0.1:`), ставьте впереди прокси с HTTPS и
   авторизацией (nginx, Caddy, Traefik) или выключите подключение к базе (`SQL_ER_DB=off`).
 - **`npm start`** открывает у draw.io служебный порт `127.0.0.1:9339`. Из сети он
   недоступен, но пока draw.io запущен так, им может воспользоваться любая программа на этом
@@ -192,16 +216,29 @@ cp .env.example .env
 
 ## Обновление и удаление
 
+Новые версии и списки изменений публикуются на странице
+[Releases](https://github.com/valeragav/drawio-sql-er/releases).
+
 **Обновление:**
 
 ```sh
+# Docker, готовый образ: скачать новый и пересоздать контейнер
+docker pull ghcr.io/valeragav/drawio-sql-er
+docker rm -f drawio-sql-er
+docker run -d --name drawio-sql-er ...   # та же команда, что при установке
+
+# Compose и Desktop: в папке проекта
 git pull
-docker compose up -d --build   # Docker
-npm install                    # Desktop: затем снова npm start
+docker compose up -d --build   # Compose
+npm install                    # Desktop, затем снова npm start
 ```
 
 В Docker после обновления перезагрузите страницу с очисткой кэша (Ctrl+F5). На сайте
-пересоберите плагин (`npm run build`) и вставьте его в консоль заново.
+скачайте новый `sql-er-plugin.js` и вставьте его в консоль заново.
 
-**Удаление:** `docker compose down --rmi all` (Docker, удалит и образ `drawio-sql-er`), затем удалите папку проекта.
-Плагин ничего не устанавливает в draw.io Desktop: без `npm start` тот запускается как обычно.
+**Удаление:**
+
+- готовый образ: `docker rm -f drawio-sql-er` и `docker rmi ghcr.io/valeragav/drawio-sql-er`;
+- Compose: `docker compose down --rmi all`, затем удалите папку проекта;
+- Desktop: удалите папку проекта. Плагин ничего не устанавливает в draw.io Desktop: без
+  `npm start` тот запускается как обычно.
