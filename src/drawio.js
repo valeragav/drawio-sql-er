@@ -6,20 +6,16 @@
 // Представления — такие же блоки с пунктирной рамкой (стрелки от таблиц из FROM/JOIN),
 // перечисления (ENUM) — блоки со значениями (пунктир к колонкам этого типа).
 
-const { planLanes, gapWidth, routeLinks } = require('./routing');
-const { computeGroups, frameBounds, FRAME_STYLE, FRAME_TOP, FRAME_BOTTOM } = require('./groups');
-
-const BAND_GAP = 40; // между полосами групп
+const { routeLinks } = require('./routing');
+const { frameBounds, FRAME_STYLE } = require('./groups');
+const { layout, buildLinks } = require('./layout');
 
 const ROW_HEIGHT = 26;
 const HEADER_HEIGHT = 30;
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 480; // длиннее — строка переносится
 const CHAR_WIDTH = 6.4;
-const H_GAP = 120; // начальный промежуток между столбцами (до расчёта дорожек)
 const LINE_HEIGHT = 14; // прибавка к высоте строки на каждую перенесённую строку
-const V_GAP = 40;
-const MARGIN = 40;
 
 const TABLE_STYLE =
   'swimlane;fontStyle=1;childLayout=stackLayout;horizontal=1;startSize=' + HEADER_HEIGHT + ';' +
@@ -259,210 +255,6 @@ function estimateTextWidth(text, fontSize = 12, bold = false) {
   return (Array.from(text).length * CHAR_WIDTH * fontSize / 12 + emoji) * (bold ? 1.1 : 1);
 }
 
-// ------------------------------------------------------------------ раскладка
-
-// Уровень таблицы = 1 + максимальный уровень её родителей (таблиц, на которые она ссылается).
-// Корневые таблицы (без FK) — в первом столбце, дочерние — правее.
-function computeLevels(tables, relations) {
-  const parents = new Map(tables.map(t => [t.name, new Set()]));
-  for (const r of relations) {
-    if (r.parent !== r.child) parents.get(r.child).add(r.parent);
-  }
-
-  const level = new Map();
-  const visiting = new Set();
-
-  function visit(name) {
-    if (level.has(name)) return level.get(name);
-    if (visiting.has(name)) return 0; // цикл ссылок — разрываем
-    visiting.add(name);
-    let lvl = 0;
-    for (const p of parents.get(name)) lvl = Math.max(lvl, visit(p) + 1);
-    visiting.delete(name);
-    level.set(name, lvl);
-    return lvl;
-  }
-
-  tables.forEach(t => visit(t.name));
-
-  // Сдвигаем таблицы вправо, насколько позволяют дети: таблица встаёт в столбец
-  // прямо перед ближайшим ребёнком, чтобы связи не перескакивали через столбцы
-  // (например, справочник, на который ссылается только одна «далёкая» таблица).
-  const children = new Map(tables.map(t => [t.name, []]));
-  for (const r of relations) {
-    if (r.parent !== r.child) children.get(r.parent).push(r.child);
-  }
-  const byLevelDesc = tables.map(t => t.name).sort((a, b) => level.get(b) - level.get(a));
-  for (const name of byLevelDesc) {
-    const kids = children.get(name).filter(c => level.get(c) > level.get(name));
-    if (!kids.length || kids.length !== children.get(name).length) continue;
-    const target = Math.min(...kids.map(c => level.get(c))) - 1;
-    if (target > level.get(name)) level.set(name, target);
-  }
-
-  return { level, parents, children };
-}
-
-function layout(graph, opts) {
-  const { nodes: tables, relations } = graph;
-  const { level, parents, children } = computeLevels(tables, relations);
-
-  const connected = new Set();
-  for (const r of relations) {
-    connected.add(r.parent);
-    connected.add(r.child);
-  }
-
-  const boxes = new Map();
-  for (const t of tables) {
-    const { width, height } = sizeRows(t.title, t.rows, opts.measureText || estimateTextWidth);
-    boxes.set(t.name, { node: t, rows: t.rows, width, height, x: 0, y: 0 });
-  }
-
-  // Столбцы по уровням; таблицы без связей — отдельным столбцом в конце.
-  const columns = [];
-  const isolated = [];
-  for (const t of tables) {
-    if (!connected.has(t.name)) { isolated.push(t.name); continue; }
-    const lvl = level.get(t.name);
-    (columns[lvl] = columns[lvl] || []).push(t.name);
-  }
-  const compact = columns.filter(Boolean);
-  if (isolated.length) compact.push(isolated);
-
-  // Группы (рамки): каждая группа — своя горизонтальная полоса, чтобы в её рамку
-  // не попадали чужие таблицы. Полоса 0 — таблицы без группы (и ENUM).
-  const groups = computeGroups(tables.filter(t => t.kind !== 'enum').map(t => t.name), opts.groupBy);
-  const bandOf = new Map(tables.map(t => [t.name, 0]));
-  const bandIsGroup = [false];
-  const minColumn = names => Math.min(...names.map(n => compact.findIndex(c => c.includes(n))));
-  [...groups.entries()]
-    .sort((a, b) => minColumn(a[1]) - minColumn(b[1]) || a[0].localeCompare(b[0]))
-    .forEach(([, members]) => {
-      bandIsGroup.push(true);
-      members.forEach(n => bandOf.set(n, bandIsGroup.length - 1));
-    });
-
-  const centerY = name => boxes.get(name).y + boxes.get(name).height / 2;
-
-  function setX(names, x) {
-    for (const name of names) boxes.get(name).x = x;
-  }
-
-  // Y всех таблиц: полоса за полосой, внутри полосы — столбцы сверху вниз.
-  function placeY(cols) {
-    let top = opts.y + MARGIN;
-    for (let b = 0; b < bandIsGroup.length; b++) {
-      const pad = bandIsGroup[b] ? FRAME_TOP : 0;
-      let bottom = -Infinity;
-      for (const names of cols) {
-        let y = top + pad;
-        for (const name of names) {
-          if (bandOf.get(name) !== b) continue;
-          const box = boxes.get(name);
-          box.y = y;
-          bottom = Math.max(bottom, y + box.height);
-          y += box.height + V_GAP;
-        }
-      }
-      if (bottom === -Infinity) continue;
-      top = bottom + (bandIsGroup[b] ? FRAME_BOTTOM : 0) + BAND_GAP + V_GAP;
-    }
-  }
-
-  // Сортировка столбца по среднему положению соседей (метод барицентров), внутри своей полосы.
-  // Таблица без соседей в нужную сторону остаётся на своём текущем месте.
-  function sortBy(names, neighbours) {
-    const keys = new Map(names.map(n => {
-      const ys = neighbours(n).map(centerY);
-      return [n, ys.length ? ys.reduce((a, b) => a + b, 0) / ys.length : centerY(n)];
-    }));
-    return names.slice().sort((a, b) => (bandOf.get(a) - bandOf.get(b)) || (keys.get(a) - keys.get(b)));
-  }
-
-  // Суммарная вертикальная длина связей — чем меньше, тем аккуратнее диаграмма.
-  const cost = () => relations.reduce((sum, r) => sum + Math.abs(centerY(r.parent) - centerY(r.child)), 0);
-
-  const columnX = [];
-  let x = opts.x + MARGIN;
-  compact.forEach((names, i) => {
-    columnX[i] = x;
-    setX(names, x);
-    x += Math.max(...names.map(n => boxes.get(n).width)) + H_GAP;
-  });
-  compact.forEach((names, i) => { compact[i] = sortBy(names, () => []); });
-  placeY(compact);
-
-  // Несколько проходов туда-обратно: слева направо тянемся к родителям,
-  // справа налево — к детям. Запоминаем лучший вариант.
-  const snapshot = () => compact.map(c => c.slice());
-  let best = snapshot();
-  let bestCost = cost();
-  const last = isolated.length ? compact.length - 1 : compact.length;
-
-  for (let pass = 0; pass < 8; pass++) {
-    const forward = pass % 2 === 0;
-    for (let k = 0; k < last; k++) {
-      const i = forward ? k : last - 1 - k;
-      const neighbours = forward ? n => Array.from(parents.get(n)) : n => children.get(n);
-      compact[i] = sortBy(compact[i], neighbours);
-      placeY(compact);
-    }
-    const c = cost();
-    if (c < bestCost) {
-      bestCost = c;
-      best = snapshot();
-    }
-  }
-
-  placeY(best);
-
-  // Порядок в столбцах выбран — теперь ширина каналов между столбцами
-  // под число дорожек связей и окончательные координаты X.
-  const columnOf = new Map();
-  best.forEach((names, i) => names.forEach(n => columnOf.set(n, i)));
-  const rowCenter = (table, column) => {
-    const box = boxes.get(table);
-    const row = column == null ? null : box.rows.find(r => r.column === column);
-    return box.y + (row ? row.y + row.height / 2 : box.height / 2);
-  };
-  const lanes = planLanes(buildLinks(relations, rowCenter), columnOf);
-  const columnWidth = best.map(names => Math.max(...names.map(n => boxes.get(n).width)));
-
-  x = opts.x + MARGIN;
-  best.forEach((names, i) => {
-    columnX[i] = x;
-    setX(names, x);
-    x += columnWidth[i] + gapWidth(lanes, i);
-  });
-
-  return { boxes, rowCenter, groups };
-}
-
-// Линии для связей: основная — по первой паре колонок внешнего ключа;
-// для составного ключа остальные пары — дополнительные (пунктир без значков).
-// from/to — таблицы, key — строка-источник (общий «ствол»), sy/ty — Y строк.
-function buildLinks(relations, rowCenter) {
-  const links = [];
-  relations.forEach(rel => {
-    const pairs = [{ parentColumn: rel.parentColumn, childColumn: rel.childColumn }]
-      .concat(rel.extraColumns || []);
-    pairs.forEach((pair, k) => links.push({
-      rel,
-      primary: k === 0,
-      parentColumn: pair.parentColumn,
-      childColumn: pair.childColumn,
-      from: rel.parent,
-      to: rel.child,
-      kind: rel.kind || 'fk',
-      key: rel.parent + '\u0000' + (pair.parentColumn == null ? '' : pair.parentColumn),
-      sy: rowCenter(rel.parent, pair.parentColumn),
-      ty: rowCenter(rel.child, pair.childColumn)
-    }));
-  });
-  return links;
-}
-
 // ---------------------------------------------------------------------- XML
 
 function escapeXml(s) {
@@ -524,9 +316,11 @@ function pointsXml(points) {
 function toGraphModelXml(model, options) {
   const opts = Object.assign({}, DEFAULTS, options);
   const graph = schemaGraph(model, opts);
-  const { boxes, rowCenter, groups } = layout(graph, opts);
+  const measure = opts.measureText || estimateTextWidth;
+  const sizes = new Map(graph.nodes.map(n => [n.name, sizeRows(n.title, n.rows, measure)]));
+  const { boxes, rowCenter, groups, via } = layout(graph, sizes, opts);
 
-  const links = buildLinks(graph.relations, rowCenter);
+  const links = buildLinks(graph.relations, rowCenter, via);
   const obstacles = [...boxes.values()].map(b => ({ id: b.node.name, x: b.x, y: b.y, width: b.width, height: b.height }));
   const routes = routeLinks(links, obstacles);
 

@@ -76,4 +76,4 @@ function frameBounds(boxes) {
   return { x: x1 - FRAME_SIDE, y: y1 - FRAME_TOP, width: x2 - x1 + 2 * FRAME_SIDE, height: y2 - y1 + FRAME_TOP + FRAME_BOTTOM };
 }
 
-module.exports = { computeGroups, frameBounds, FRAME_STYLE, FRAME_TOP, FRAME_BOTTOM };
+module.exports = { computeGroups, frameBounds, FRAME_STYLE, FRAME_TOP, FRAME_SIDE, FRAME_BOTTOM };

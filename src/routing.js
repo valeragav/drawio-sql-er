@@ -9,6 +9,8 @@
 //   - если таблицы в соседних столбцах — идёт по дорожке до строки ребёнка и входит сбоку;
 //   - иначе идёт по горизонтальному «коридору» между таблицами промежуточных столбцов
 //     до дорожки в канале у ребёнка, а оттуда — к его строке.
+// Если раскладка оставила для длинной связи «окна» в промежуточных столбцах (link.via),
+// связь идёт через них: в каждом промежуточном канале — своя дорожка-«ступенька».
 // Связи из одной строки (один источник) делят дорожку — «ствол» с ответвлениями,
 // разные источники идут по разным дорожкам. Каналы и коридоры свободны от таблиц,
 // поэтому линии не проходят сквозь таблицы.
@@ -24,8 +26,18 @@ const CLEARANCE = 14;     // отступ коридора от таблиц
 const LOOP_OFFSET = 30;   // петля «ссылка на себя» — слева от таблицы
 
 // Столбцы по фактическому расположению: таблицы, пересекающиеся по X, — в одном столбце.
-function deriveColumns(tables) {
-  const sorted = tables.slice().sort((a, b) => a.x - b.x);
+// Таблица без связей (например, в сетке под схемой) столбцы не склеивает: если она
+// задевает столбцы связанных таблиц — она только препятствие в них; если стоит между
+// столбцами на уровне схемы — сама становится столбцом (её обходят).
+function deriveColumns(tables, linked) {
+  const isLinked = t => !linked || linked.has(t.id);
+  const main = tables.filter(isLinked);
+  const top = Math.min(...main.map(t => t.y));
+  const bottom = Math.max(...main.map(t => t.y + t.height));
+  const touches = t => main.some(m => t.x < m.x + m.width && t.x + t.width > m.x);
+  const standalone = t => !isLinked(t) && !touches(t) && t.y < bottom && t.y + t.height > top;
+  const inColumns = t => isLinked(t) || standalone(t);
+  const sorted = tables.filter(inColumns).sort((a, b) => a.x - b.x);
   const columns = [];
   for (const t of sorted) {
     const last = columns[columns.length - 1];
@@ -38,27 +50,45 @@ function deriveColumns(tables) {
   }
   const columnOf = new Map();
   columns.forEach((c, i) => c.tables.forEach(t => columnOf.set(t.id, i)));
+  for (const t of tables) {
+    if (inColumns(t)) continue;
+    columns.forEach(c => { if (t.x < c.right && t.x + t.width > c.left) c.tables.push(t); });
+  }
   return { columns, columnOf };
 }
 
-// Какие каналы использует связь: номер канала g — промежуток справа от столбца g.
-function gapsOf(link, columnOf) {
+// Есть ли у связи «окна» на каждый промежуточный столбец.
+function hasVia(link, columnOf) {
+  const span = Math.abs(columnOf.get(link.to) - columnOf.get(link.from));
+  return Array.isArray(link.via) && span > 1 && link.via.length === span - 1;
+}
+
+// Какие каналы использует связь: номер канала g — промежуток справа от столбца g —
+// и ключ дорожки в нём. Ствол источника (первый канал) — общий для связей из одной
+// строки; ступеньки через окна — у каждой связи свои.
+function laneUses(link, columnOf) {
   if (link.from === link.to) return [];
   const a = columnOf.get(link.from);
   const b = columnOf.get(link.to);
-  if (a < b) return b - 1 === a ? [a] : [a, b - 1];
-  if (a > b) return a - 1 === b ? [b] : [a - 1, b];
-  return [a];
+  if (a === b) return [{ gap: a, key: link.key, y: link.sy }];
+  const gaps = [];
+  for (let c = a; c !== b; c += a < b ? 1 : -1) gaps.push(a < b ? c : c - 1);
+  if (hasVia(link, columnOf)) {
+    const own = link.key + '\u0001' + link.to + '\u0001' + link.ty;
+    return gaps.map((gap, i) => ({ gap, key: i ? own : link.key, y: i ? link.via[i - 1] : link.sy }));
+  }
+  const ends = gaps.length === 1 ? gaps : [gaps[0], gaps[gaps.length - 1]];
+  return ends.map(gap => ({ gap, key: link.key, y: link.sy }));
 }
 
-// Дорожки в каждом канале: ключ источника → номер дорожки.
-// Порядок — по высоте строки-источника, чтобы стволы меньше пересекались.
+// Дорожки в каждом канале: ключ → номер дорожки.
+// Порядок — по высоте входа в канал, чтобы стволы меньше пересекались.
 function planLanes(links, columnOf) {
   const perGap = new Map();
   for (const link of links) {
-    for (const g of gapsOf(link, columnOf)) {
-      if (!perGap.has(g)) perGap.set(g, new Map());
-      perGap.get(g).set(link.key, link.sy);
+    for (const { gap, key, y } of laneUses(link, columnOf)) {
+      if (!perGap.has(gap)) perGap.set(gap, new Map());
+      perGap.get(gap).set(key, y);
     }
   }
   const lanes = new Map();
@@ -120,7 +150,8 @@ function candidateTracks(free) {
 //         ключ источника (строка родителя) и абсолютные Y строк.
 // Возвращает массив (по индексу связи): { points: [{x, y}], exit: 'left'|'right', entry: 'left'|'right' }.
 function routeLinks(links, tables) {
-  const { columns, columnOf } = deriveColumns(tables);
+  const linked = new Set(links.flatMap(l => [l.from, l.to]));
+  const { columns, columnOf } = deriveColumns(tables, linked);
   const lanes = planLanes(links, columnOf);
   const byId = new Map(tables.map(t => [t.id, t]));
 
@@ -184,6 +215,20 @@ function routeLinks(links, tables) {
 
     if (firstGap === lastGap) {
       routes[i] = { points: sy === ty ? [] : [{ x: x1, y: sy }, { x: x1, y: ty }], ...side };
+      continue;
+    }
+
+    if (hasVia(link, columnOf)) {
+      // Через окна: ступенька в каждом канале, горизонталь — по Y окна.
+      const uses = laneUses(link, columnOf);
+      const ys = [sy, ...link.via, ty];
+      const points = [];
+      uses.forEach((u, k) => {
+        const lx = laneX(u.gap, u.key);
+        points.push({ x: lx, y: ys[k] }, { x: lx, y: ys[k + 1] });
+        if (k) horizontals.push({ y: ys[k], x1: laneX(uses[k - 1].gap, uses[k - 1].key), x2: lx, key });
+      });
+      routes[i] = { points, ...side };
       continue;
     }
 
