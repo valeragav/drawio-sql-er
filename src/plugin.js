@@ -9,6 +9,7 @@ const { parseSql } = require('./parser');
 const { toGraphModelXml } = require('./drawio');
 const { reroute, updatePage, pageCells, diagramModel, markDiff } = require('./page');
 const { diffSchemas, formatDiff } = require('./diff');
+const { legendNode } = require('./legend');
 const { exportSql } = require('./export');
 const { selectTables, withRelated } = require('./select');
 const { installHighlight } = require('./highlight');
@@ -382,6 +383,7 @@ function showDialog(ui) {
   detailBox.addEventListener('change', syncNullable);
   syncNullable();
   div.appendChild(options);
+  div.appendChild(legendNode());
 
   const buttons = el('div', 'display:flex;justify-content:flex-end;gap:8px;');
 
