@@ -468,7 +468,9 @@ function showDialog(ui) {
   buttons.appendChild(insertBtn);
   div.appendChild(buttons);
 
-  ui.showDialog(div, 900, 560, true, true);
+  // Высота — почти на всё окно draw.io (но не меньше 560 и не больше 820).
+  const height = Math.max(560, Math.min(820, (window.innerHeight || 0) - 80));
+  ui.showDialog(div, 900, height, true, true);
   (radios.db.checked ? urlInput : textarea).focus();
 }
 
