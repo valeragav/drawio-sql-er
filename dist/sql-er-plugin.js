@@ -1205,8 +1205,9 @@ module.exports = { toGraphModelXml, columnLabel, indexLabel };
   defs["plugin"] = function (module, exports, require) {
 'use strict';
 
-// Плагин draw.io: «Вставка → Из SQL (ER-диаграмма)…».
-// Окно с полем для PostgreSQL DDL; по кнопке «Вставить» строит таблицы и связи на текущей странице.
+// Плагин draw.io: «Упорядочить → Вставить → Из SQL (ER-диаграмма)…».
+// Окно: источник SQL (вставить / файл / база PostgreSQL) → поле с DDL → «Вставить»
+// строит таблицы и связи на текущей странице.
 
 const { parseSql } = require('./parser');
 const { toGraphModelXml } = require('./drawio');
@@ -1214,6 +1215,8 @@ const { toGraphModelXml } = require('./drawio');
 const ACTION = 'sqlErImport';
 
 function register(ui) {
+  installBridgeResponse();
+
   // Повторная загрузка (обновлённая сборка): меню уже дополнено — только подменяем обработчик.
   const existing = ui.actions.get && ui.actions.get(ACTION);
   if (existing) {
@@ -1234,30 +1237,190 @@ function register(ui) {
   }
 }
 
+// ------------------------------------------------------------- мост к базе
+//
+// Сама страница draw.io не может подключиться к PostgreSQL (нет сокетов, а CSP
+// запрещает запросы даже к localhost). Скрипт запуска (npm start) регистрирует
+// в окне функцию window.sqlErDbRequest (Runtime.addBinding): плагин передаёт в неё
+// запрос, скрипт читает схему из базы и возвращает ответ через __sqlErDbResponse.
+
+const BRIDGE = 'sqlErDbRequest';
+const DB_TIMEOUT_MS = 30000;
+const pending = new Map();
+let requestSeq = 0;
+
+function bridgeAvailable() {
+  return typeof window !== 'undefined' && typeof window[BRIDGE] === 'function';
+}
+
+function installBridgeResponse() {
+  if (typeof window === 'undefined') return;
+  window.__sqlErDbResponse = json => {
+    const res = JSON.parse(json);
+    const p = pending.get(res.id);
+    if (!p) return;
+    clearTimeout(p.timer);
+    pending.delete(res.id);
+    if (res.error) p.reject(new Error(res.error));
+    else p.resolve(res);
+  };
+}
+
+function requestSchema(url, schemas) {
+  return new Promise((resolve, reject) => {
+    const id = ++requestSeq;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error('Нет ответа от скрипта запуска за 30 секунд'));
+    }, DB_TIMEOUT_MS);
+    pending.set(id, { resolve, reject, timer });
+    window[BRIDGE](JSON.stringify({ id, url, schemas }));
+  });
+}
+
+// ---------------------------------------------------------- настройки окна
+// Запоминаем способ и подключение (без пароля) — только для удобства.
+
+const SETTINGS_KEY = 'sql-er-plugin';
+
+function loadSettings() {
+  try {
+    return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveSettings(patch) {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(Object.assign(loadSettings(), patch)));
+  } catch (e) { /* хранилище недоступно — не страшно */ }
+}
+
+function withoutPassword(url) {
+  try {
+    const u = new URL(url);
+    u.password = '';
+    return u.toString();
+  } catch (e) {
+    return '';
+  }
+}
+
+function withPassword(url, password) {
+  try {
+    const u = new URL(url);
+    u.password = password; // URL сам экранирует спецсимволы
+    return u.toString();
+  } catch (e) {
+    return url;
+  }
+}
+
 // ---------------------------------------------------------------------- окно
 
+const MODES = [
+  { id: 'paste', label: 'Вставить SQL' },
+  { id: 'file', label: 'Файл .sql' },
+  { id: 'db', label: 'База PostgreSQL' }
+];
+
+const PLACEHOLDERS = {
+  paste: 'CREATE TABLE users (\n  id SERIAL PRIMARY KEY,\n  email TEXT NOT NULL UNIQUE\n);\n\n' +
+    'CREATE TABLE orders (\n  id SERIAL PRIMARY KEY,\n  user_id INTEGER NOT NULL REFERENCES users(id)\n);',
+  file: 'Здесь появится содержимое файла — его можно поправить перед вставкой.',
+  db: 'Здесь появится схема из базы (CREATE TABLE / CREATE INDEX) — её можно поправить перед вставкой.'
+};
+
+function el(tag, css, text) {
+  const node = document.createElement(tag);
+  if (css) node.style.cssText = css;
+  if (text) node.textContent = text;
+  return node;
+}
+
 function showDialog(ui) {
-  const div = document.createElement('div');
-  div.style.cssText = 'display:flex;flex-direction:column;height:100%;box-sizing:border-box;gap:8px;';
+  const settings = loadSettings();
+  const div = el('div', 'display:flex;flex-direction:column;height:100%;box-sizing:border-box;gap:8px;');
 
-  const title = document.createElement('div');
-  title.textContent = 'Вставьте PostgreSQL DDL (CREATE TABLE / ALTER TABLE) или откройте .sql-файл';
-  title.style.cssText = 'font-weight:bold;';
-  div.appendChild(title);
+  // --- выбор способа
+  const modeRow = el('div', 'display:flex;gap:16px;align-items:center;flex-wrap:wrap;');
+  modeRow.appendChild(el('span', 'font-weight:bold;', 'Источник:'));
+  const radios = {};
+  const group = 'sql-er-mode-' + Date.now();
+  for (const mode of MODES) {
+    const label = el('label', 'display:flex;align-items:center;gap:4px;cursor:pointer;');
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = group;
+    input.value = mode.id;
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(mode.label));
+    modeRow.appendChild(label);
+    radios[mode.id] = input;
+  }
+  div.appendChild(modeRow);
 
+  // --- панель «Файл»
+  const filePanel = el('div', 'display:flex;gap:8px;align-items:center;');
+  const fileInput = document.createElement('input');
+  fileInput.type = 'file';
+  fileInput.accept = '.sql,.ddl,.txt,text/plain';
+  fileInput.style.display = 'none';
+  const pickBtn = mxUtils.button('Выбрать файл…', () => fileInput.click());
+  pickBtn.className = 'geBtn';
+  pickBtn.style.margin = '0';
+  const fileName = el('span', 'opacity:0.8;', 'файл не выбран — можно и перетащить его в поле ниже');
+  filePanel.appendChild(pickBtn);
+  filePanel.appendChild(fileName);
+  filePanel.appendChild(fileInput);
+  div.appendChild(filePanel);
+
+  // --- панель «База»
+  const dbPanel = el('div', 'display:flex;flex-direction:column;gap:6px;');
+  const dbRow = el('div', 'display:flex;gap:8px;align-items:center;');
+  const urlInput = document.createElement('input');
+  urlInput.type = 'text';
+  urlInput.placeholder = 'postgres://user@localhost:5432/dbname';
+  urlInput.value = settings.url || '';
+  urlInput.setAttribute('spellcheck', 'false');
+  urlInput.style.cssText = 'flex:1;min-width:0;box-sizing:border-box;padding:4px;' +
+    'font-family:Consolas,Menlo,monospace;font-size:12px;';
+  // Пароль — отдельно и скрыто; не сохраняется.
+  const passwordInput = document.createElement('input');
+  passwordInput.type = 'password';
+  passwordInput.placeholder = 'пароль';
+  passwordInput.autocomplete = 'off';
+  passwordInput.style.cssText = 'width:110px;box-sizing:border-box;padding:4px;font-size:12px;';
+  passwordInput.addEventListener('keydown', e => { if (e.key === 'Enter') loadFromDb(); });
+  const schemaInput = document.createElement('input');
+  schemaInput.type = 'text';
+  schemaInput.value = settings.schemas || 'public';
+  schemaInput.title = 'Схемы через запятую';
+  schemaInput.style.cssText = 'width:120px;box-sizing:border-box;padding:4px;font-size:12px;';
+  const connectBtn = mxUtils.button('Подключиться', () => loadFromDb());
+  connectBtn.className = 'geBtn';
+  connectBtn.style.margin = '0';
+  dbRow.appendChild(urlInput);
+  dbRow.appendChild(passwordInput);
+  dbRow.appendChild(el('span', '', 'схемы:'));
+  dbRow.appendChild(schemaInput);
+  dbRow.appendChild(connectBtn);
+  dbPanel.appendChild(dbRow);
+  const dbNote = el('div', 'font-size:12px;opacity:0.8;');
+  dbPanel.appendChild(dbNote);
+  div.appendChild(dbPanel);
+
+  // --- общее поле SQL
   const textarea = document.createElement('textarea');
   textarea.setAttribute('spellcheck', 'false');
   textarea.setAttribute('wrap', 'off');
-  textarea.placeholder =
-    'CREATE TABLE users (\n  id SERIAL PRIMARY KEY,\n  email TEXT NOT NULL UNIQUE\n);\n\n' +
-    'CREATE TABLE orders (\n  id SERIAL PRIMARY KEY,\n  user_id INTEGER NOT NULL REFERENCES users(id)\n);';
   textarea.style.cssText =
     'flex:1;min-height:0;width:100%;box-sizing:border-box;resize:none;' +
     'font-family:Consolas,Menlo,monospace;font-size:12px;padding:6px;';
   div.appendChild(textarea);
 
-  const status = document.createElement('div');
-  status.style.cssText = 'min-height:16px;font-size:12px;opacity:0.8;white-space:pre-wrap;max-height:60px;overflow:auto;';
+  const status = el('div', 'min-height:16px;font-size:12px;opacity:0.8;white-space:pre-wrap;max-height:60px;overflow:auto;');
   div.appendChild(status);
 
   const updateStatus = () => {
@@ -1279,21 +1442,60 @@ function showDialog(ui) {
     const reader = new FileReader();
     reader.onload = () => {
       textarea.value = reader.result;
+      fileName.textContent = file.name;
       updateStatus();
     };
     reader.readAsText(file);
   };
-
+  fileInput.addEventListener('change', () => loadFile(fileInput.files[0]));
   textarea.addEventListener('dragover', e => e.preventDefault());
   textarea.addEventListener('drop', e => {
     if (e.dataTransfer && e.dataTransfer.files.length) {
       e.preventDefault();
+      setMode('file');
       loadFile(e.dataTransfer.files[0]);
     }
   });
 
-  const options = document.createElement('div');
-  options.style.cssText = 'display:flex;gap:16px;align-items:center;flex-wrap:wrap;';
+  async function loadFromDb() {
+    let url = urlInput.value.trim();
+    if (!url) { dbNote.textContent = 'Укажите строку подключения'; return; }
+    const schemas = schemaInput.value.split(',').map(s => s.trim()).filter(Boolean);
+    saveSettings({ url: withoutPassword(url), schemas: schemas.join(', ') });
+    if (passwordInput.value) url = withPassword(url, passwordInput.value);
+    connectBtn.disabled = true;
+    dbNote.textContent = 'Подключаюсь…';
+    try {
+      const res = await requestSchema(url, schemas.length ? schemas : ['public']);
+      textarea.value = res.sql;
+      dbNote.textContent = res.message || `Прочитано таблиц: ${res.tables}. Проверьте SQL ниже и нажмите «Вставить».`;
+      updateStatus();
+    } catch (err) {
+      dbNote.textContent = '✖ ' + err.message;
+    } finally {
+      connectBtn.disabled = !bridgeAvailable();
+    }
+  }
+
+  function setMode(mode) {
+    radios[mode].checked = true;
+    filePanel.style.display = mode === 'file' ? 'flex' : 'none';
+    dbPanel.style.display = mode === 'db' ? 'flex' : 'none';
+    textarea.placeholder = PLACEHOLDERS[mode];
+    if (mode === 'db') {
+      const ok = bridgeAvailable();
+      connectBtn.disabled = !ok;
+      dbNote.textContent = ok
+        ? 'Только чтение: берётся структура (таблицы, ключи, CHECK, индексы), данные не читаются.'
+        : '✖ Подключение к базе работает, только если draw.io запущен через «npm start» в папке плагина.';
+    }
+    saveSettings({ mode });
+  }
+  for (const mode of MODES) radios[mode.id].addEventListener('change', () => setMode(mode.id));
+  setMode(radios[settings.mode] ? settings.mode : 'paste');
+
+  // --- параметры и кнопки
+  const options = el('div', 'display:flex;gap:16px;align-items:center;flex-wrap:wrap;');
   const replaceBox = checkbox(options, 'Заменить содержимое страницы', false);
   const detailBox = checkbox(options, 'Ограничения как в SQL', true);
   const nullableBox = checkbox(options, 'Показывать NULL', true);
@@ -1307,19 +1509,7 @@ function showDialog(ui) {
   syncNullable();
   div.appendChild(options);
 
-  const fileInput = document.createElement('input');
-  fileInput.type = 'file';
-  fileInput.accept = '.sql,.ddl,.txt,text/plain';
-  fileInput.style.display = 'none';
-  fileInput.addEventListener('change', () => loadFile(fileInput.files[0]));
-  div.appendChild(fileInput);
-
-  const buttons = document.createElement('div');
-  buttons.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;';
-
-  const openBtn = mxUtils.button('Открыть .sql…', () => fileInput.click());
-  openBtn.className = 'geBtn';
-  openBtn.style.marginRight = 'auto';
+  const buttons = el('div', 'display:flex;justify-content:flex-end;gap:8px;');
 
   const cancelBtn = mxUtils.button(mxResources.get('cancel') || 'Отмена', () => ui.hideDialog());
   cancelBtn.className = 'geBtn';
@@ -1343,13 +1533,12 @@ function showDialog(ui) {
   });
   insertBtn.className = 'geBtn gePrimaryBtn';
 
-  buttons.appendChild(openBtn);
   buttons.appendChild(cancelBtn);
   buttons.appendChild(insertBtn);
   div.appendChild(buttons);
 
-  ui.showDialog(div, 640, 480, true, true);
-  textarea.focus();
+  ui.showDialog(div, 720, 540, true, true);
+  (radios.db.checked ? urlInput : textarea).focus();
 }
 
 function checkbox(parent, text, checked) {
