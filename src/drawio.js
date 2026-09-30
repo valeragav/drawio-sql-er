@@ -6,13 +6,13 @@
 
 const { planLanes, gapWidth, routeLinks } = require('./routing');
 
-const ROW_HEIGHT = 30;
+const ROW_HEIGHT = 26;
 const HEADER_HEIGHT = 30;
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 480; // длиннее — строка переносится
 const CHAR_WIDTH = 6.4;
 const H_GAP = 120; // начальный промежуток между столбцами (до расчёта дорожек)
-const LINE_HEIGHT = 15; // прибавка к высоте строки на каждую перенесённую строку
+const LINE_HEIGHT = 14; // прибавка к высоте строки на каждую перенесённую строку
 const V_GAP = 40;
 const MARGIN = 40;
 
@@ -27,7 +27,7 @@ const ROW_STYLE =
   'rotatable=0;points=[[0,0.5],[1,0.5]];portConstraint=eastwest;html=1;';
 
 const NOTE_STYLE = ROW_STYLE + 'fontSize=11;textOpacity=60;';
-const NOTE_HEIGHT = 24;
+const NOTE_HEIGHT = 20;
 
 // Разделитель между колонками и блоком индексов/ограничений (как в ER-фигурах draw.io).
 const DIVIDER_STYLE =

@@ -54,8 +54,13 @@ const DB_TIMEOUT_MS = 30000;
 const pending = new Map();
 let requestSeq = 0;
 
+// Функция sqlErDbRequest остаётся в окне и после остановки скрипта запуска, поэтому
+// одной её мало: скрипт каждые ~1,5 с отмечается в window.__sqlErBridgeSeen.
+const BRIDGE_ALIVE_MS = 5000;
+
 function bridgeAvailable() {
-  return typeof window !== 'undefined' && typeof window[BRIDGE] === 'function';
+  return typeof window !== 'undefined' && typeof window[BRIDGE] === 'function' &&
+    Date.now() - (window.__sqlErBridgeSeen || 0) < BRIDGE_ALIVE_MS;
 }
 
 function installBridgeResponse() {
@@ -212,7 +217,7 @@ function showDialog(ui) {
   dbRow.appendChild(schemaInput);
   dbRow.appendChild(connectBtn);
   dbPanel.appendChild(dbRow);
-  const dbNote = el('div', 'font-size:12px;opacity:0.8;white-space:pre-wrap;max-height:48px;overflow:auto;');
+  const dbNote = el('div', 'font-size:12px;opacity:0.8;');
   dbPanel.appendChild(dbNote);
   div.appendChild(dbPanel);
 
@@ -231,8 +236,12 @@ function showDialog(ui) {
   workArea.appendChild(picker.node);
   div.appendChild(workArea);
 
-  const status = el('div', 'min-height:16px;font-size:12px;opacity:0.8;white-space:pre-wrap;max-height:60px;overflow:auto;');
+  const status = el('div', 'min-height:16px;font-size:12px;opacity:0.8;white-space:pre-wrap;max-height:72px;overflow:auto;');
   div.appendChild(status);
+
+  // Предупреждения, пришедшие вместе со схемой из базы (например, дубли ограничений), —
+  // показываются в общем блоке под полем вместе с предупреждениями разбора.
+  let sourceWarnings = [];
 
   const updateStatus = () => {
     if (!textarea.value.trim()) {
@@ -244,7 +253,8 @@ function showDialog(ui) {
     picker.setSchema(model);
     const indexes = model.tables.reduce((n, t) => n + t.indexes.length, 0);
     let text = `Таблиц: ${model.tables.length}, связей: ${model.relations.length}, индексов: ${indexes}`;
-    if (model.warnings.length) text += '\n⚠ ' + model.warnings.join('\n⚠ ');
+    const warnings = sourceWarnings.concat(model.warnings);
+    if (warnings.length) text += '\n⚠ ' + warnings.join('\n⚠ ');
     status.textContent = text;
   };
   let timer = null;
@@ -257,6 +267,7 @@ function showDialog(ui) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
+      sourceWarnings = [];
       textarea.value = reader.result;
       fileName.textContent = file.name;
       updateStatus();
@@ -284,9 +295,8 @@ function showDialog(ui) {
     try {
       const res = await requestSchema(url, schemas.length ? schemas : ['public']);
       textarea.value = res.sql;
-      let note = res.message || `Прочитано таблиц: ${res.tables}. Проверьте SQL ниже и нажмите «Вставить».`;
-      if (res.warnings && res.warnings.length) note += '\n⚠ ' + res.warnings.join('\n⚠ ');
-      dbNote.textContent = note;
+      sourceWarnings = res.warnings || [];
+      dbNote.textContent = res.message || `Прочитано таблиц: ${res.tables}. Проверьте SQL ниже и нажмите «Вставить».`;
       updateStatus();
     } catch (err) {
       dbNote.textContent = '✖ ' + err.message;
@@ -295,7 +305,14 @@ function showDialog(ui) {
     }
   }
 
+  let currentMode = null;
   function setMode(mode) {
+    // Сменили источник — предупреждения прежнего источника больше не относятся к делу.
+    if (currentMode && mode !== currentMode && sourceWarnings.length) {
+      sourceWarnings = [];
+      updateStatus();
+    }
+    currentMode = mode;
     radios[mode].checked = true;
     filePanel.style.display = mode === 'file' ? 'flex' : 'none';
     dbPanel.style.display = mode === 'db' ? 'flex' : 'none';

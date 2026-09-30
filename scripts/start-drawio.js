@@ -95,6 +95,8 @@ class PageSession {
 
   // Плагин загружен в окно? Если нет и редактор готов — загружаем.
   async ensurePlugin() {
+    // Отметка «мост жив» — по ней плагин понимает, что подключение к базе доступно.
+    await this.evaluate('window.__sqlErBridgeSeen = Date.now()');
     const state = await this.evaluate(
       "typeof window.__sqlErDbResponse === 'function' ? 'loaded' : " +
       "(typeof window.Draw === 'object' && typeof window.Draw.loadPlugin === 'function' ? 'ready' : 'wait')");

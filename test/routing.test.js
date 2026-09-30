@@ -152,6 +152,6 @@ test('длинные строки переносятся: таблица не ш
   assert.ok(tables[0].w <= 480, 'ширина не больше 480');
   const xml = toGraphModelXml(m);
   const row = /value="v : INT[^"]*"[^>]*><mxGeometry x="0" y="[\d.]+" width="[\d.]+" height="([\d.]+)"/.exec(xml);
-  assert.ok(+row[1] > 30, 'перенесённая строка выше обычной');
+  assert.ok(+row[1] > 26, 'перенесённая строка выше обычной');
   assert.match(xml, /whiteSpace=wrap/);
 });
