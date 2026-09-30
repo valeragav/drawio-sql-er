@@ -128,7 +128,7 @@ function columnDdl(col, inline) {
 // запуске миграции: колонку PostgreSQL пропускает, а CHECK добавляет снова (users_role_check1, 2, …).
 const constraintKey = c => [c.table_oid, c.type, (c.columns || []).join(','), c.def].join('\u0000');
 
-// Сообщения о дублях: «users: одинаковое ограничение CHECK (…) — 52 шт. (users_role_check, …)».
+// Сообщения о дублях: «users: одинаковое ограничение CHECK (…) повторяется 52 раза (users_role_check, …)».
 function duplicateConstraints({ tables, constraints }) {
   const groups = new Map();
   for (const c of constraints) {
@@ -143,7 +143,7 @@ function duplicateConstraints({ tables, constraints }) {
     const names = group.map(c => c.name);
     const shown = names.length > 3 ? `${names.slice(0, 3).join(', ')}, …` : names.join(', ');
     messages.push(`${table ? table.name : '?'}: одинаковое ограничение ${simplifyExpr(group[0].def)} ` +
-      `повторяется ${times(group.length)} (${shown}) — показано один раз`);
+      `повторяется ${times(group.length)} (${shown})`);
   }
   return messages;
 }
@@ -159,18 +159,11 @@ function times(n) {
 // rows: { tables, columns, constraints, indexes } — строки из запросов выше.
 function buildDdl({ tables, columns, constraints, indexes }) {
   const out = [];
-  const seen = new Set();
   for (const table of tables) {
     const oid = String(table.oid);
     const cols = columns.filter(c => String(c.table_oid) === oid);
-    // Дубли ограничений показываем один раз (см. duplicateConstraints).
-    const cons = constraints.filter(c => {
-      if (String(c.table_oid) !== oid) return false;
-      const key = constraintKey(c);
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    // Все ограничения — как в базе, в том числе дубли (о них — предупреждение, см. duplicateConstraints).
+    const cons = constraints.filter(c => String(c.table_oid) === oid);
 
     // Ограничения на одну колонку пишем в строке колонки, остальные — отдельно.
     const inlineFor = new Map(cols.map(c => [c.attnum, []]));
