@@ -16,19 +16,29 @@
 // Разбор PostgreSQL DDL в модель для ER-диаграммы: таблицы (CREATE/ALTER TABLE), индексы,
 // перечисления (CREATE/ALTER TYPE … ENUM), представления (CREATE [MATERIALIZED] VIEW)
 // и комментарии (COMMENT ON). Всё остальное (функции, INSERT, …) пропускается.
+// Понимает и MySQL / SQLite: `имена`, [имена], AUTO_INCREMENT / AUTOINCREMENT, KEY / INDEX
+// внутри CREATE TABLE, COMMENT '…' у колонок и таблиц, ENGINE=…, #-комментарии (для MySQL).
 
 // Слова, на которых заканчивается тип колонки и начинаются её ограничения.
 const COLUMN_STOP = new Set([
   'CONSTRAINT', 'NOT', 'NULL', 'PRIMARY', 'REFERENCES', 'UNIQUE', 'DEFAULT',
-  'CHECK', 'COLLATE', 'GENERATED', 'DEFERRABLE', 'INITIALLY'
+  'CHECK', 'COLLATE', 'GENERATED', 'DEFERRABLE', 'INITIALLY',
+  'AUTO_INCREMENT', 'AUTOINCREMENT', 'COMMENT', 'ON' // MySQL / SQLite
 ]);
+
+// Признаки MySQL: регистр имён не меняется, «#» — комментарий.
+const MYSQL_HINT = /`|\bENGINE\s*=|\bAUTO_INCREMENT\b|\bUNSIGNED\b/i;
+
+// PostgreSQL приводит имена без кавычек к нижнему регистру, MySQL — нет.
+let foldCase = true;
 
 const SERIAL_TYPE = /^(SMALL|BIG)?SERIAL[248]?$/i;
 
 // ---------------------------------------------------------------- токенизатор
 
 // comments — если передан массив, в него складываются «--»-комментарии { start, end, text }.
-function tokenize(src, comments) {
+// opts.hashComments — «#» тоже начинает комментарий (MySQL).
+function tokenize(src, comments, opts = {}) {
   const tokens = [];
   const n = src.length;
   let i = 0;
@@ -38,10 +48,10 @@ function tokenize(src, comments) {
 
     if (/\s/.test(c)) { i++; continue; }
 
-    if (c === '-' && src[i + 1] === '-') {
+    if ((c === '-' && src[i + 1] === '-') || (c === '#' && opts.hashComments)) {
       const e = src.indexOf('\n', i);
       const end = e < 0 ? n : e;
-      if (comments) comments.push({ start: i, end, text: src.slice(i + 2, end).trim() });
+      if (comments) comments.push({ start: i, end, text: src.slice(c === '#' ? i + 1 : i + 2, end).trim() });
       i = e < 0 ? n : e + 1;
       continue;
     }
@@ -84,6 +94,32 @@ function tokenize(src, comments) {
         const e = src.indexOf(tag, i + tag.length);
         i = e < 0 ? n : e + tag.length;
         tokens.push({ type: 'string', value: src.slice(start, i), start, end: i });
+        continue;
+      }
+    }
+
+    // MySQL: `имя` (`` — экранированная обратная кавычка)
+    if (c === '`') {
+      let value = '';
+      i++;
+      while (i < n) {
+        if (src[i] === '`') {
+          if (src[i + 1] === '`') { value += '`'; i += 2; continue; }
+          i++;
+          break;
+        }
+        value += src[i++];
+      }
+      tokens.push({ type: 'ident', value, start, end: i });
+      continue;
+    }
+
+    // SQLite / SQL Server: [имя]. Массивы PostgreSQL (TEXT[], int[3]) сюда не попадают.
+    if (c === '[') {
+      const m = /^\[([A-Za-z_\u0080-\uffff][^\]\n]*)\]/.exec(src.slice(i, i + 256));
+      if (m) {
+        i += m[0].length;
+        tokens.push({ type: 'ident', value: m[1], start, end: i });
         continue;
       }
     }
@@ -223,8 +259,8 @@ class Cursor {
 }
 
 function identValue(t) {
-  // Имена без кавычек PostgreSQL приводит к нижнему регистру.
-  return t.type === 'ident' ? t.value : t.value.toLowerCase();
+  // Имена без кавычек PostgreSQL приводит к нижнему регистру (MySQL — нет).
+  return t.type === 'ident' || !foldCase ? t.value : t.value.toLowerCase();
 }
 
 function splitTopLevel(tokens) {
@@ -261,7 +297,9 @@ function parseSql(src) {
 
   state.lineComments = [];
   state.src = src;
-  for (const stmt of splitStatements(tokenize(src, state.lineComments))) {
+  const mysql = MYSQL_HINT.test(src);
+  foldCase = !mysql;
+  for (const stmt of splitStatements(tokenize(src, state.lineComments, { hashComments: mysql }))) {
     const cur = new Cursor(stmt, src);
     try {
       if (cur.isWord('CREATE')) parseCreate(cur, state);
@@ -302,9 +340,52 @@ function parseCreate(cur, state) {
 
   for (const item of splitTopLevel(body)) {
     const c = new Cursor(item, cur.src);
-    if (isTableConstraint(c)) parseTableConstraint(c, table);
+    if (isInlineIndex(c)) parseInlineIndex(c, table);
+    else if (isTableConstraint(c)) parseTableConstraint(c, table);
     else if (!c.isWord('LIKE')) parseColumn(c, table, state);
   }
+
+  // Параметры таблицы (MySQL): ENGINE=… DEFAULT CHARSET=… COMMENT='…'; SQLite: WITHOUT ROWID.
+  while (!cur.done()) {
+    if (cur.acceptWord('COMMENT')) {
+      if (cur.isPunct('=')) cur.next();
+      const text = stringValue(cur.next());
+      if (text) table.comment = text;
+      continue;
+    }
+    cur.next();
+  }
+}
+
+// MySQL: KEY / INDEX / FULLTEXT KEY / SPATIAL INDEX [имя] (колонки) [USING BTREE] внутри CREATE TABLE
+// (и в ALTER TABLE … ADD INDEX). Столбец с именем key/index отличаем по «(» после имени.
+function isInlineIndex(c) {
+  let k = 0;
+  if (c.isWord('FULLTEXT', 'SPATIAL')) k = 1;
+  const kw = c.peek(k);
+  if (!kw || kw.type !== 'word' || !['KEY', 'INDEX'].includes(kw.upper)) return k === 1;
+  const next = c.peek(k + 1);
+  const after = c.peek(k + 2);
+  return !!next && ((next.type === 'punct' && next.value === '(') ||
+    ((next.type === 'word' || next.type === 'ident') && after && after.type === 'punct' && after.value === '('));
+}
+
+function parseInlineIndex(c, table) {
+  let method = null;
+  const kind = c.acceptWord('FULLTEXT', 'SPATIAL');
+  if (kind) method = kind.upper.toLowerCase();
+  c.acceptWord('KEY', 'INDEX');
+  let name = null;
+  if (!c.isPunct('(')) name = identValue(c.next());
+  if (c.acceptWord('USING')) method = c.next().value.toLowerCase();
+  const group = c.group();
+  if (!group) return;
+  if (c.acceptWord('USING')) method = c.next().value.toLowerCase();
+  table.indexes.push({
+    name, unique: false, method,
+    columns: splitTopLevel(group).map(part => tokensText(part, c.src)),
+    include: [], where: null
+  });
 }
 
 // CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] [имя] ON [ONLY] таблица [USING метод]
@@ -383,7 +464,9 @@ function parseAlter(cur, state) {
         state.warnings.push(`ALTER TABLE для неизвестной таблицы ${parts.join('.')}`);
         return;
       }
-      if (isTableConstraint(c)) {
+      if (isInlineIndex(c)) {
+        parseInlineIndex(c, table);
+      } else if (isTableConstraint(c)) {
         parseTableConstraint(c, table);
       } else {
         c.acceptWord('COLUMN');
@@ -444,9 +527,12 @@ function parseTableConstraint(c, table) {
     table.primaryKey = columnList(c.group() || []);
   } else if (c.acceptWord('UNIQUE')) {
     c.acceptWords('NULLS', 'NOT', 'DISTINCT') || c.acceptWords('NULLS', 'DISTINCT');
+    c.acceptWord('KEY', 'INDEX'); // MySQL: UNIQUE KEY имя (…)
+    if (!c.isPunct('(') && c.peek()) c.next();
     const cols = columnList(c.group() || []);
     if (cols.length) table.uniques.push(cols);
   } else if (c.acceptWords('FOREIGN', 'KEY')) {
+    if (!c.isPunct('(') && c.peek()) c.next(); // MySQL: FOREIGN KEY имя (…)
     const columns = columnList(c.group() || []);
     if (!c.acceptWord('REFERENCES')) return;
     const ref = parseReference(c);
@@ -484,6 +570,7 @@ function parseColumn(c, table, state) {
     if (c.isPunct('(')) { c.skipGroup(); continue; }
     const t = c.peek();
     if (t.type === 'word' && COLUMN_STOP.has(t.upper)) break;
+    if (t.type === 'word' && t.upper === 'CHARACTER' && c.peek(1) && c.peek(1).upper === 'SET') break; // MySQL
     c.next();
   }
   col.type = c.text(typeStart, c.pos);
@@ -500,9 +587,17 @@ function parseColumn(c, table, state) {
     if (c.acceptWords('PRIMARY', 'KEY')) { col.primaryKey = true; continue; }
     if (c.acceptWord('UNIQUE')) {
       c.acceptWords('NULLS', 'NOT', 'DISTINCT') || c.acceptWords('NULLS', 'DISTINCT');
+      c.acceptWord('KEY'); // MySQL: UNIQUE KEY
       col.unique = true;
       continue;
     }
+    if (c.acceptWord('AUTO_INCREMENT', 'AUTOINCREMENT')) { col.autoIncrement = true; continue; }
+    if (c.acceptWord('COMMENT')) { // MySQL: COMMENT '…' — комментарий колонки
+      const text = stringValue(c.next());
+      if (text) col.explicitComment = text;
+      continue;
+    }
+    if (c.acceptWords('CHARACTER', 'SET')) { c.next(); continue; }
     if (c.acceptWord('REFERENCES')) {
       const ref = parseReference(c);
       if (ref) table.foreignKeys.push({ columns: [col.name], ...ref });
@@ -540,11 +635,14 @@ function parseColumn(c, table, state) {
     c.next();
   }
 
-  col.constraints = c.text(constraintsStart, c.tokens.length);
-  // «--» в конце строки колонки или строками прямо над ней.
+  // COMMENT '…' (MySQL) показываем подсказкой, а не в строке колонки.
+  col.constraints = c.text(constraintsStart, c.tokens.length).replace(/\s*\bCOMMENT\s+'(?:[^']|'')*'/gi, '').trim();
+  // Комментарий: COMMENT '…', иначе «--» в конце строки колонки или строками прямо над ней.
   if (state) {
-    col.comment = trailingComment(state, c.tokens[c.tokens.length - 1].end) || leadingComment(state, nameTok.start);
+    col.comment = col.explicitComment ||
+      trailingComment(state, c.tokens[c.tokens.length - 1].end) || leadingComment(state, nameTok.start);
   }
+  delete col.explicitComment;
   table.columns.push(col);
 }
 
@@ -4008,6 +4106,6 @@ if (typeof Draw !== 'undefined' && Draw.loadPlugin) {
 
   };
 
-  if (typeof window !== 'undefined') window.__sqlErBuild = "56d76d5b27be";
+  if (typeof window !== 'undefined') window.__sqlErBuild = "d5e51320052d";
   require("plugin");
 })();
