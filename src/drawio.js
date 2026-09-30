@@ -10,7 +10,7 @@ const ROW_HEIGHT = 30;
 const HEADER_HEIGHT = 30;
 const MIN_WIDTH = 180;
 const MAX_WIDTH = 480; // длиннее — строка переносится
-const CHAR_WIDTH = 6.6;
+const CHAR_WIDTH = 6.4;
 const H_GAP = 120; // начальный промежуток между столбцами (до расчёта дорожек)
 const LINE_HEIGHT = 15; // прибавка к высоте строки на каждую перенесённую строку
 const V_GAP = 40;
@@ -103,19 +103,27 @@ function buildRows(table, opts) {
   return rows;
 }
 
-// Ширина строки по тексту (жирный текст PK шире примерно на 10%).
-function rowTextWidth(row) {
-  return textWidth(row.label, row.note ? 11 : 12) * (/fontStyle=[13];/.test(row.style) ? 1.1 : 1) + 24;
+const TEXT_PADDING = 16; // spacingLeft + spacingRight у строки
+const WIDTH_SLACK = 6;   // запас, чтобы текст не упирался в край
+const WRAP_WASTE = 0.9;  // при переносе по словам строка заполняется не до конца
+
+// Ширина текста строки: в draw.io плагин передаёт точное измерение (opts.measureText),
+// без браузера (тесты) — оценка по числу символов.
+function rowTextWidth(row, measure) {
+  return measure(row.label, row.note ? 11 : 12, /fontStyle=[13];/.test(row.style));
 }
 
 // Ширина таблицы; строки, которые в неё не влезли, переносятся — считаем их высоту и Y.
-function sizeRows(table, rows) {
-  const widest = Math.max(textWidth(table.name) * 1.1 + 40, ...rows.map(rowTextWidth));
+function sizeRows(table, rows, measure) {
+  const widest = Math.max(measure(table.name, 12, true) + 40,
+    ...rows.map(r => rowTextWidth(r, measure) + TEXT_PADDING + WIDTH_SLACK));
   const width = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.ceil(widest / 10) * 10));
+  const available = width - TEXT_PADDING;
   let y = HEADER_HEIGHT;
   for (const row of rows) {
     if (!row.divider) {
-      const lines = Math.max(1, Math.ceil(rowTextWidth(row) / width));
+      const text = rowTextWidth(row, measure);
+      const lines = text <= available ? 1 : Math.ceil(text / (available * WRAP_WASTE));
       row.height += (lines - 1) * (row.note ? LINE_HEIGHT - 2 : LINE_HEIGHT);
     }
     row.y = y;
@@ -124,10 +132,11 @@ function sizeRows(table, rows) {
   return { width, height: y };
 }
 
-function textWidth(text, fontSize = 12) {
-  // Грубая оценка ширины; эмодзи шире обычного символа.
+// Оценка ширины без браузера: средняя ширина символа Helvetica 12px (сверено с draw.io);
+// жирный шрифт шире примерно на 10%, эмодзи — шире обычного символа.
+function estimateTextWidth(text, fontSize = 12, bold = false) {
   const emoji = /^(🔑|🔍)/.test(text) ? 8 : 0;
-  return Array.from(text).length * CHAR_WIDTH * fontSize / 12 + emoji;
+  return (Array.from(text).length * CHAR_WIDTH * fontSize / 12 + emoji) * (bold ? 1.1 : 1);
 }
 
 // ------------------------------------------------------------------ раскладка
@@ -187,7 +196,7 @@ function layout(model, opts) {
   const boxes = new Map();
   for (const t of tables) {
     const rows = buildRows(t, opts);
-    const { width, height } = sizeRows(t, rows);
+    const { width, height } = sizeRows(t, rows, opts.measureText || estimateTextWidth);
     boxes.set(t.name, { table: t, rows, width, height, x: 0, y: 0 });
   }
 

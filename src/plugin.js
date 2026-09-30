@@ -347,7 +347,8 @@ function showDialog(ui) {
   const renderOptions = () => ({
     detail: detailBox.checked ? 'sql' : 'tags',
     showNullable: nullableBox.checked,
-    showIndexes: indexesBox.checked
+    showIndexes: indexesBox.checked,
+    measureText
   });
 
   const insertBtn = mxUtils.button('Вставить', () => {
@@ -486,6 +487,13 @@ function tablePicker() {
       render();
     }
   };
+}
+
+// Ширина текста так, как её нарисует draw.io (шрифт по умолчанию, html-подпись):
+// по ней считается ширина таблиц и какие строки переносить.
+function measureText(text, fontSize, bold) {
+  return mxUtils.getSizeForString(mxUtils.htmlEntities(text), fontSize,
+    mxConstants.DEFAULT_FONTFAMILY, null, bold ? mxConstants.FONT_BOLD : 0).width;
 }
 
 function checkbox(parent, text, checked) {
