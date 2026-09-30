@@ -10,6 +10,7 @@ const { toGraphModelXml } = require('./drawio');
 const { reroute, updatePage, pageCells, diagramModel, markDiff } = require('./page');
 const { diffSchemas, formatDiff } = require('./diff');
 const { legendNode } = require('./legend');
+const { toMermaid } = require('./mermaid');
 const { exportSql } = require('./export');
 const { selectTables, withRelated } = require('./select');
 const { installHighlight } = require('./highlight');
@@ -25,7 +26,7 @@ function register(ui) {
   addAction(ui, REROUTE, 'Перепроложить связи (SQL ER)', () => {
     if (!reroute(ui)) mxUtils.alert('На странице нет связей, построенных плагином «Из SQL (ER-диаграмма)».');
   }, 'arrange');
-  addAction(ui, EXPORT, 'Экспорт в SQL (SQL ER)...', () => showExportDialog(ui), 'arrange');
+  addAction(ui, EXPORT, 'Экспорт в SQL / Mermaid (SQL ER)...', () => showExportDialog(ui), 'arrange');
 
   // Подсветка связей выбранной таблицы — переключатель в меню «Упорядочить».
   if (ui.editor && ui.editor.graph) {
@@ -557,17 +558,37 @@ function showDiffDialog(ui, schema, source, updateFromSchema) {
 // «Копировать» и «Сохранить .sql».
 
 function showExportDialog(ui) {
-  const { sql, warnings } = exportSql(pageCells(ui));
+  const cells = pageCells(ui);
+  const { sql, warnings } = exportSql(cells);
   if (!/CREATE (TABLE|TYPE)/.test(sql)) {
     mxUtils.alert('На странице нет таблиц, вставленных плагином «Из SQL (ER-диаграмма)».');
     return;
   }
+  const settings = loadSettings();
 
   const div = el('div', 'display:flex;flex-direction:column;height:100%;box-sizing:border-box;gap:8px;');
-  div.appendChild(el('div', 'font-weight:bold;', 'SQL по диаграмме на текущей странице'));
+
+  // Формат: SQL или Mermaid (erDiagram — для Markdown: GitHub, GitLab, …).
+  const formatRow = el('div', 'display:flex;gap:16px;align-items:center;flex-wrap:wrap;');
+  formatRow.appendChild(el('span', 'font-weight:bold;', 'Экспорт диаграммы:'));
+  const group = 'sql-er-export-' + Date.now();
+  const radio = (value, text) => {
+    const label = el('label', 'display:flex;align-items:center;gap:4px;cursor:pointer;');
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = group;
+    input.value = value;
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(text));
+    formatRow.appendChild(label);
+    return input;
+  };
+  const sqlRadio = radio('sql', 'SQL');
+  const mermaidRadio = radio('mermaid', 'Mermaid (erDiagram)');
+  const markdownBox = checkbox(formatRow, 'для Markdown (```mermaid)', !!settings.exportMarkdown);
+  div.appendChild(formatRow);
 
   const textarea = document.createElement('textarea');
-  textarea.value = sql;
   textarea.readOnly = true;
   textarea.setAttribute('spellcheck', 'false');
   textarea.setAttribute('wrap', 'off');
@@ -576,31 +597,27 @@ function showExportDialog(ui) {
   div.appendChild(textarea);
 
   const status = el('div', 'min-height:16px;font-size:12px;opacity:0.8;white-space:pre-wrap;max-height:60px;overflow:auto;');
-  if (warnings.length) status.textContent = '⚠ ' + warnings.join('\n⚠ ');
   div.appendChild(status);
 
-  const buttons = el('div', 'display:flex;justify-content:flex-end;gap:8px;');
-  const copyBtn = mxUtils.button('Копировать', () => {
-    const done = () => { status.textContent = 'Скопировано в буфер обмена'; };
-    const fallback = () => {
-      textarea.focus();
-      textarea.select();
-      document.execCommand('copy');
-      done();
-    };
-    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(sql).then(done, fallback);
-    else fallback();
-  });
-  copyBtn.className = 'geBtn';
+  const baseName = (ui.currentPage ? ui.currentPage.getName() : 'schema').replace(/[\\/:*?"<>|]+/g, '_');
+  let mermaidText = null;
+  const current = () => {
+    if (sqlRadio.checked) return { text: sql, ext: 'sql', mime: 'text/plain' };
+    if (mermaidText === null) mermaidText = toMermaid(diagramModel(ui));
+    return markdownBox.checked
+      ? { text: '```mermaid\n' + mermaidText + '```\n', ext: 'md', mime: 'text/markdown' }
+      : { text: mermaidText, ext: 'mmd', mime: 'text/plain' };
+  };
 
-  const fileName = (ui.currentPage ? ui.currentPage.getName() : 'schema').replace(/[\\/:*?"<>|]+/g, '_') + '.sql';
-  const saveBtn = mxUtils.button('Сохранить .sql', () => {
+  const saveBtn = mxUtils.button('Сохранить', () => {
+    const { text, ext, mime } = current();
+    const fileName = `${baseName}.${ext}`;
     // В draw.io есть свой диалог сохранения (в desktop — системный); иначе — загрузка файла.
     if (typeof ui.saveData === 'function') {
-      ui.saveData(fileName, 'sql', sql, 'text/plain;charset=utf-8');
+      ui.saveData(fileName, ext, text, mime + ';charset=utf-8');
     } else {
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([sql], { type: 'text/plain;charset=utf-8' }));
+      a.href = URL.createObjectURL(new Blob([text], { type: mime + ';charset=utf-8' }));
       a.download = fileName;
       document.body.appendChild(a);
       a.click();
@@ -608,6 +625,34 @@ function showExportDialog(ui) {
     }
   });
   saveBtn.className = 'geBtn';
+
+  const render = () => {
+    const { text, ext } = current();
+    textarea.value = text;
+    markdownBox.disabled = sqlRadio.checked;
+    markdownBox.parentNode.style.opacity = sqlRadio.checked ? '0.5' : '';
+    saveBtn.textContent = `Сохранить .${ext}`;
+    status.textContent = sqlRadio.checked && warnings.length ? '⚠ ' + warnings.join('\n⚠ ')
+      : mermaidRadio.checked ? 'ENUM и представления в Mermaid не поддерживаются — они в комментариях %%.' : '';
+    saveSettings({ exportFormat: sqlRadio.checked ? 'sql' : 'mermaid', exportMarkdown: markdownBox.checked });
+  };
+  (settings.exportFormat === 'mermaid' ? mermaidRadio : sqlRadio).checked = true;
+  [sqlRadio, mermaidRadio, markdownBox].forEach(input => input.addEventListener('change', render));
+
+  const buttons = el('div', 'display:flex;justify-content:flex-end;gap:8px;');
+  const copyBtn = mxUtils.button('Копировать', () => {
+    const text = textarea.value;
+    const done = () => { status.textContent = 'Скопировано в буфер обмена'; };
+    const fallback = () => {
+      textarea.focus();
+      textarea.select();
+      document.execCommand('copy');
+      done();
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback);
+    else fallback();
+  });
+  copyBtn.className = 'geBtn';
 
   const closeBtn = mxUtils.button(mxResources.get('close') || 'Закрыть', () => ui.hideDialog());
   closeBtn.className = 'geBtn gePrimaryBtn';
@@ -617,7 +662,8 @@ function showExportDialog(ui) {
   buttons.appendChild(closeBtn);
   div.appendChild(buttons);
 
-  ui.showDialog(div, 760, 520, true, true);
+  ui.showDialog(div, 760, 540, true, true);
+  render();
   textarea.focus();
 }
 
