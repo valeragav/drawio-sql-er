@@ -309,4 +309,36 @@ function unmarkRemoved(style) {
   return style;
 }
 
-module.exports = { reroute, updatePage, refreshFrames };
+// Снимок ячеек текущей страницы для экспорта в SQL (src/export.js): простые объекты
+// с видимым текстом (HTML-подписи приводятся к тексту), стилем, подсказкой и Y.
+function pageCells(ui) {
+  const graph = ui.editor.graph;
+  const model = graph.getModel();
+  const layer = graph.getDefaultParent();
+  const div = document.createElement('div');
+  const text = c => {
+    const value = graph.convertValueToString(c) || '';
+    if (!graph.isHtmlLabel(c)) return value;
+    div.innerHTML = value;
+    return div.textContent;
+  };
+  return model.getDescendants(layer).filter(c => c !== layer).map(c => {
+    const g = model.getGeometry(c);
+    const source = model.getTerminal(c, true);
+    const target = model.getTerminal(c, false);
+    return {
+      id: c.id,
+      parent: model.getParent(c).id,
+      vertex: model.isVertex(c),
+      edge: model.isEdge(c),
+      style: model.getStyle(c) || '',
+      value: text(c),
+      tooltip: c.value && c.value.getAttribute ? c.value.getAttribute('tooltip') : null,
+      y: g ? g.y : 0,
+      source: source ? source.id : null,
+      target: target ? target.id : null
+    };
+  });
+}
+
+module.exports = { reroute, updatePage, refreshFrames, pageCells };

@@ -7,13 +7,15 @@
 
 const { parseSql } = require('./parser');
 const { toGraphModelXml } = require('./drawio');
-const { reroute, updatePage } = require('./page');
+const { reroute, updatePage, pageCells } = require('./page');
+const { exportSql } = require('./export');
 const { selectTables, withRelated } = require('./select');
 const { installHighlight } = require('./highlight');
 
 const ACTION = 'sqlErImport';
 const REROUTE = 'sqlErReroute';
 const HIGHLIGHT = 'sqlErHighlight';
+const EXPORT = 'sqlErExport';
 
 function register(ui) {
   installBridgeResponse();
@@ -21,6 +23,7 @@ function register(ui) {
   addAction(ui, REROUTE, 'Перепроложить связи (SQL ER)', () => {
     if (!reroute(ui)) mxUtils.alert('На странице нет связей, построенных плагином «Из SQL (ER-диаграмма)».');
   }, 'arrange');
+  addAction(ui, EXPORT, 'Экспорт в SQL (SQL ER)...', () => showExportDialog(ui), 'arrange');
 
   // Подсветка связей выбранной таблицы — переключатель в меню «Упорядочить».
   if (ui.editor && ui.editor.graph) {
@@ -448,6 +451,76 @@ function showDialog(ui) {
 
   ui.showDialog(div, 900, 560, true, true);
   (radios.db.checked ? urlInput : textarea).focus();
+}
+
+// ------------------------------------------------------------ экспорт в SQL
+//
+// SQL по тому, что сейчас нарисовано на странице (с правками): окно с текстом,
+// «Копировать» и «Сохранить .sql».
+
+function showExportDialog(ui) {
+  const { sql, warnings } = exportSql(pageCells(ui));
+  if (!/CREATE (TABLE|TYPE)/.test(sql)) {
+    mxUtils.alert('На странице нет таблиц, вставленных плагином «Из SQL (ER-диаграмма)».');
+    return;
+  }
+
+  const div = el('div', 'display:flex;flex-direction:column;height:100%;box-sizing:border-box;gap:8px;');
+  div.appendChild(el('div', 'font-weight:bold;', 'SQL по диаграмме на текущей странице'));
+
+  const textarea = document.createElement('textarea');
+  textarea.value = sql;
+  textarea.readOnly = true;
+  textarea.setAttribute('spellcheck', 'false');
+  textarea.setAttribute('wrap', 'off');
+  textarea.style.cssText = 'flex:1;min-height:0;width:100%;box-sizing:border-box;resize:none;' +
+    'font-family:Consolas,Menlo,monospace;font-size:12px;padding:6px;';
+  div.appendChild(textarea);
+
+  const status = el('div', 'min-height:16px;font-size:12px;opacity:0.8;white-space:pre-wrap;max-height:60px;overflow:auto;');
+  if (warnings.length) status.textContent = '⚠ ' + warnings.join('\n⚠ ');
+  div.appendChild(status);
+
+  const buttons = el('div', 'display:flex;justify-content:flex-end;gap:8px;');
+  const copyBtn = mxUtils.button('Копировать', () => {
+    const done = () => { status.textContent = 'Скопировано в буфер обмена'; };
+    const fallback = () => {
+      textarea.focus();
+      textarea.select();
+      document.execCommand('copy');
+      done();
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(sql).then(done, fallback);
+    else fallback();
+  });
+  copyBtn.className = 'geBtn';
+
+  const fileName = (ui.currentPage ? ui.currentPage.getName() : 'schema').replace(/[\\/:*?"<>|]+/g, '_') + '.sql';
+  const saveBtn = mxUtils.button('Сохранить .sql', () => {
+    // В draw.io есть свой диалог сохранения (в desktop — системный); иначе — загрузка файла.
+    if (typeof ui.saveData === 'function') {
+      ui.saveData(fileName, 'sql', sql, 'text/plain;charset=utf-8');
+    } else {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([sql], { type: 'text/plain;charset=utf-8' }));
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+  });
+  saveBtn.className = 'geBtn';
+
+  const closeBtn = mxUtils.button(mxResources.get('close') || 'Закрыть', () => ui.hideDialog());
+  closeBtn.className = 'geBtn gePrimaryBtn';
+
+  buttons.appendChild(copyBtn);
+  buttons.appendChild(saveBtn);
+  buttons.appendChild(closeBtn);
+  div.appendChild(buttons);
+
+  ui.showDialog(div, 760, 520, true, true);
+  textarea.focus();
 }
 
 // ------------------------------------------------------------ список таблиц

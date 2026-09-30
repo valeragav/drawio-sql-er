@@ -56,7 +56,8 @@ test('плагин регистрируется в draw.io', () => {
   assert.equal(typeof actions.sqlErReroute, 'function', 'действие «Перепроложить связи»');
   assert.equal(resources.sqlErReroute, 'Перепроложить связи (SQL ER)');
   arrangeMenu.funct('arrange', null);
-  assert.deepEqual(arrangeAdded, ['-', 'sqlErReroute'], 'пункт в меню «Упорядочить»');
+  assert.deepEqual(arrangeAdded, ['-', 'sqlErReroute', '-', 'sqlErExport'], 'пункты в меню «Упорядочить»');
+  assert.equal(typeof actions.sqlErExport, 'function', 'действие «Экспорт в SQL»');
 
   // повторная загрузка не дублирует пункты меню
   registered(ui);
