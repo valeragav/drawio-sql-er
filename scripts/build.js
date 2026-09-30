@@ -6,9 +6,10 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const root = path.join(__dirname, '..');
-const modules = ['parser', 'routing', 'placement', 'select', 'drawio', 'page', 'plugin'];
+const modules = ['parser', 'routing', 'placement', 'select', 'groups', 'drawio', 'page', 'highlight', 'plugin'];
 const entry = 'plugin';
 
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
@@ -25,12 +26,18 @@ out += '    }\n';
 out += '    return cache[key].exports;\n';
 out += '  }\n';
 
+const hash = crypto.createHash('sha1');
 for (const name of modules) {
-  const source = fs.readFileSync(path.join(root, 'src', name + '.js'), 'utf8');
+  const source = fs.readFileSync(path.join(root, 'src', name + '.js'), 'utf8').split('\r\n').join('\n');
+  hash.update(name + '\0' + source);
   out += `\n  defs[${JSON.stringify(name)}] = function (module, exports, require) {\n${source}\n  };\n`;
 }
 
-out += `\n  require(${JSON.stringify(entry)});\n})();\n`;
+// Отпечаток сборки: по нему скрипт запуска понимает, что в окне draw.io старая
+// версия плагина, и подгружает новую.
+const buildId = hash.digest('hex').slice(0, 12);
+out += `\n  if (typeof window !== 'undefined') window.__sqlErBuild = ${JSON.stringify(buildId)};\n`;
+out += `  require(${JSON.stringify(entry)});\n})();\n`;
 
 fs.mkdirSync(path.join(root, 'dist'), { recursive: true });
 const target = path.join(root, 'dist', 'sql-er-plugin.js');

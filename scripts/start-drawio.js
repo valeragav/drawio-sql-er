@@ -97,8 +97,10 @@ class PageSession {
   async ensurePlugin() {
     // Отметка «мост жив» — по ней плагин понимает, что подключение к базе доступно.
     await this.evaluate('window.__sqlErBridgeSeen = Date.now()');
+    // Загружен ли плагин именно этой сборки (иначе — подгружаем новую поверх старой).
+    const build = (/window\.__sqlErBuild = "([0-9a-f]+)"/.exec(this.code) || [])[1] || '';
     const state = await this.evaluate(
-      "typeof window.__sqlErDbResponse === 'function' ? 'loaded' : " +
+      `window.__sqlErBuild === ${JSON.stringify(build)} ? 'loaded' : ` +
       "(typeof window.Draw === 'object' && typeof window.Draw.loadPlugin === 'function' ? 'ready' : 'wait')");
     if (state !== 'ready') return state === 'loaded';
     await this.evaluate(this.code);

@@ -9,6 +9,7 @@ const { toGraphModelXml, sideStyle, schemaGraph, DEFAULTS } = require('./drawio'
 const { routeLinks } = require('./routing');
 const { placeNewTables } = require('./placement');
 const { selectTables } = require('./select');
+const { computeGroups, frameBounds, FRAME_STYLE } = require('./groups');
 
 const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
 
@@ -72,6 +73,10 @@ function reroute(ui) {
     return t.y + r.y + r.height / 2;
   };
 
+  // Рамки групп — по текущим положениям таблиц (тем же способом, что и при вставке).
+  const frame = graph.getChildVertices(layer).find(c => hasFlag(model.getStyle(c), 'sqlErGroup'));
+  if (frame) refreshFrames(ui, styleValue(model.getStyle(frame), 'sqlErGroupBy') || 'prefix');
+
   const links = [];
   const edges = [];
   for (const e of linksOf(layer)) {
@@ -106,6 +111,38 @@ function reroute(ui) {
     model.endUpdate();
   }
   return links.length;
+}
+
+// Пересоздаёт рамки групп на странице: старые рамки плагина удаляются, новые строятся
+// вокруг текущих положений таблиц. groupBy: 'none' — рамок нет.
+function refreshFrames(ui, groupBy) {
+  const graph = ui.editor.graph;
+  const layer = graph.getDefaultParent();
+  const { model, isTable, nameOf, geo } = helpers(graph);
+
+  const tables = graph.getChildVertices(layer).filter(c => isTable(c) && !nameOf(c).startsWith('enum:'));
+  const byName = new Map(tables.map(c => [nameOf(c), c]));
+  const groups = computeGroups([...byName.keys()], groupBy);
+
+  model.beginUpdate();
+  try {
+    for (const c of graph.getChildVertices(layer)) {
+      if (hasFlag(model.getStyle(c), 'sqlErGroup')) model.remove(c);
+    }
+    for (const [name, members] of groups) {
+      const f = frameBounds(members.map(n => {
+        const g = geo(byName.get(n));
+        return { x: g.x, y: g.y, width: g.width, height: g.height };
+      }));
+      const style = FRAME_STYLE + `sqlErGroupBy=${groupBy};sqlErName=${encodeURIComponent('group:' + name)};`;
+      const cell = new mxCell(name, new mxGeometry(f.x, f.y, f.width, f.height), style);
+      cell.setVertex(true);
+      model.add(layer, cell, 0); // позади таблиц
+    }
+  } finally {
+    model.endUpdate();
+  }
+  return groups.size;
 }
 
 // ------------------------------------------------------------- «Обновить»
@@ -148,7 +185,7 @@ function updatePage(ui, fullSchema, opts, selected) {
   const freshCells = fresh.getChildren(freshLayer) || [];
   const freshTables = new Map();
   for (const c of freshCells) {
-    if (fresh.isVertex(c)) freshTables.set(decodeURIComponent(styleValue(fresh.getStyle(c), 'sqlErName')), c);
+    if (fresh.isVertex(c) && hasFlag(fresh.getStyle(c), 'sqlErTable')) freshTables.set(decodeURIComponent(styleValue(fresh.getStyle(c), 'sqlErName')), c);
   }
   const freshEdges = freshCells.filter(c => fresh.isEdge(c));
 
@@ -243,6 +280,7 @@ function updatePage(ui, fullSchema, opts, selected) {
     }
 
     reroute(ui);
+    refreshFrames(ui, opts.groupBy || 'none');
   } finally {
     model.endUpdate();
   }
@@ -271,4 +309,4 @@ function unmarkRemoved(style) {
   return style;
 }
 
-module.exports = { reroute, updatePage };
+module.exports = { reroute, updatePage, refreshFrames };

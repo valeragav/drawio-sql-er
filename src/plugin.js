@@ -9,9 +9,11 @@ const { parseSql } = require('./parser');
 const { toGraphModelXml } = require('./drawio');
 const { reroute, updatePage } = require('./page');
 const { selectTables, withRelated } = require('./select');
+const { installHighlight } = require('./highlight');
 
 const ACTION = 'sqlErImport';
 const REROUTE = 'sqlErReroute';
+const HIGHLIGHT = 'sqlErHighlight';
 
 function register(ui) {
   installBridgeResponse();
@@ -19,18 +21,29 @@ function register(ui) {
   addAction(ui, REROUTE, 'Перепроложить связи (SQL ER)', () => {
     if (!reroute(ui)) mxUtils.alert('На странице нет связей, построенных плагином «Из SQL (ER-диаграмма)».');
   }, 'arrange');
+
+  // Подсветка связей выбранной таблицы — переключатель в меню «Упорядочить».
+  if (ui.editor && ui.editor.graph) {
+    const highlight = installHighlight(ui);
+    const action = addAction(ui, HIGHLIGHT, 'Подсветка связей (SQL ER)',
+      () => highlight.setEnabled(!highlight.isEnabled()), 'arrange');
+    if (action && action.setToggleAction) {
+      action.setToggleAction(true);
+      action.setSelectedCallback(() => ui.__sqlErHighlight.isEnabled());
+    }
+  }
 }
 
-// Добавляет действие и пункт меню. При повторной загрузке плагина (обновлённая сборка)
-// меню уже дополнено — только подменяем обработчик.
+// Добавляет действие и пункт меню; возвращает действие. При повторной загрузке плагина
+// (обновлённая сборка) меню уже дополнено — только подменяем обработчик.
 function addAction(ui, name, label, funct, menuName) {
   const existing = ui.actions.get && ui.actions.get(name);
   if (existing) {
     existing.funct = funct;
-    return;
+    return existing;
   }
   mxResources.parse(name + '=' + label);
-  ui.actions.addAction(name, funct);
+  const action = ui.actions.addAction(name, funct);
 
   const menu = ui.menus.get(menuName);
   if (menu) {
@@ -40,6 +53,7 @@ function addAction(ui, name, label, funct, menuName) {
       ui.menus.addMenuItems(m, ['-', name], parent);
     };
   }
+  return action;
 }
 
 // ------------------------------------------------------------- мост к базе
@@ -341,6 +355,21 @@ function showDialog(ui) {
   const enumsBox = checkbox(options, 'ENUM', true);
   const viewsBox = checkbox(options, 'Представления', true);
   const commentsBox = checkbox(options, 'Комментарии', true);
+
+  // Рамки групп: по схемам (billing.*) или по префиксам имён (course_*, article_*).
+  const groupLabel = el('label', 'display:flex;align-items:center;gap:4px;');
+  groupLabel.appendChild(document.createTextNode('Группы:'));
+  const groupSelect = document.createElement('select');
+  for (const [value, text] of [['none', 'нет'], ['schema', 'по схемам'], ['prefix', 'по префиксам']]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = text;
+    groupSelect.appendChild(option);
+  }
+  groupSelect.value = settings.groupBy || 'prefix';
+  groupSelect.addEventListener('change', () => saveSettings({ groupBy: groupSelect.value }));
+  groupLabel.appendChild(groupSelect);
+  options.appendChild(groupLabel);
   // «NULL» — метка короткого режима; в режиме SQL видно, есть ли NOT NULL.
   const syncNullable = () => {
     nullableBox.disabled = detailBox.checked;
@@ -374,6 +403,7 @@ function showDialog(ui) {
     showEnums: enumsBox.checked,
     showViews: viewsBox.checked,
     showComments: commentsBox.checked,
+    groupBy: groupSelect.value,
     measureText
   });
 
