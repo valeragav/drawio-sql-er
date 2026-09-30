@@ -2205,11 +2205,11 @@ module.exports = { reroute, updatePage, refreshFrames };
 'use strict';
 
 // Подсветка связей выбранной таблицы: выделили таблицу (или любую её строку) —
-// её связи и соседние таблицы обводятся голубым. Это временная обводка поверх
+// её связи и соседние таблицы обводятся красным. Это временная обводка поверх
 // диаграммы (mxCellHighlight): диаграмму не меняет, в историю Ctrl+Z не попадает.
 // Включается/выключается пунктом меню; состояние запоминается.
 
-const COLOR = '#1a73e8';
+const COLOR = '#e53935';
 const SETTING = 'sql-er-highlight';
 
 const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
@@ -2908,6 +2908,6 @@ if (typeof Draw !== 'undefined' && Draw.loadPlugin) {
 
   };
 
-  if (typeof window !== 'undefined') window.__sqlErBuild = "762317ab0a82";
+  if (typeof window !== 'undefined') window.__sqlErBuild = "1d8a4bd550bc";
   require("plugin");
 })();
