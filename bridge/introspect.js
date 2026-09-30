@@ -214,7 +214,15 @@ async function introspect(connectionString, schemas = ['public']) {
     throw new Error('Не установлен драйвер PostgreSQL. В папке проекта выполните: npm install');
   }
 
-  const client = new pg.Client({ connectionString, connectionTimeoutMillis: 10000 });
+  const client = new pg.Client({
+    connectionString,
+    connectionTimeoutMillis: 10000,
+    // Каждый запрос к каталогу — не дольше 30 с (огромная или занятая база не «повесит»
+    // окно плагина); имя приложения видно администратору в pg_stat_activity.
+    statement_timeout: 30000,
+    query_timeout: 35000,
+    fallback_application_name: 'drawio-sql-er' // application_name из строки подключения важнее
+  });
   await client.connect();
   try {
     await client.query('SET default_transaction_read_only = on');

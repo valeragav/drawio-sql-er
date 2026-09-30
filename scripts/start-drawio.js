@@ -11,13 +11,21 @@
 //
 //   node scripts/start-drawio.js [файл.drawio]
 
+// Встроенный WebSocket (соединение с окном draw.io) есть в Node.js начиная с 22.
+const NODE_MAJOR = Number(process.versions.node.split('.')[0]);
+if (NODE_MAJOR < 22 || typeof WebSocket !== 'function') {
+  console.error(`Нужен Node.js 22 или новее (сейчас ${process.version}). Скачайте: https://nodejs.org`);
+  process.exit(1);
+}
+
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const { introspect } = require('../bridge/introspect');
 
 const root = path.join(__dirname, '..');
-const PORT = Number(process.env.DRAWIO_DEBUG_PORT) || 9229;
+// Не 9229: это порт отладчика Node.js (node --inspect), они бы мешали друг другу.
+const PORT = Number(process.env.DRAWIO_DEBUG_PORT) || 9339;
 const START_TIMEOUT_MS = 60000;
 const POLL_MS = 1500;
 const BINDING = 'sqlErDbRequest';
@@ -147,8 +155,12 @@ function humanError(err) {
     ETIMEDOUT: 'Превышено время ожидания подключения',
     '28P01': 'Неверный пользователь или пароль',
     '3D000': 'База данных не найдена',
-    '28000': 'Доступ запрещён (pg_hba.conf)'
+    '28000': 'Доступ запрещён (pg_hba.conf)',
+    '57014': 'База слишком долго отвечает на запрос к каталогу (больше 30 с)',
+    '42501': 'Нет прав на чтение каталога базы'
   };
+  if (/Query read timeout/i.test(err.message)) return map['57014'];
+  if (/timeout expired|Connection terminated due to connection timeout/i.test(err.message)) return map.ETIMEDOUT;
   return map[err.code] || err.message;
 }
 
