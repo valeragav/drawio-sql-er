@@ -38,9 +38,9 @@ async function targets() {
 
 // Соединение с одним окном draw.io через DevTools Protocol.
 class PageSession {
-  constructor(target, code) {
+  constructor(target, getCode) {
     this.target = target;
-    this.code = code;
+    this.getCode = getCode; // актуальная сборка плагина (перечитывается при изменении файла)
     this.id = 0;
     this.pending = new Map();
     this.closed = false;
@@ -98,12 +98,13 @@ class PageSession {
     // Отметка «мост жив» — по ней плагин понимает, что подключение к базе доступно.
     await this.evaluate('window.__sqlErBridgeSeen = Date.now()');
     // Загружен ли плагин именно этой сборки (иначе — подгружаем новую поверх старой).
-    const build = (/window\.__sqlErBuild = "([0-9a-f]+)"/.exec(this.code) || [])[1] || '';
+    const code = this.getCode();
+    const build = (/window\.__sqlErBuild = "([0-9a-f]+)"/.exec(code) || [])[1] || '';
     const state = await this.evaluate(
       `window.__sqlErBuild === ${JSON.stringify(build)} ? 'loaded' : ` +
       "(typeof window.Draw === 'object' && typeof window.Draw.loadPlugin === 'function' ? 'ready' : 'wait')");
     if (state !== 'ready') return state === 'loaded';
-    await this.evaluate(this.code);
+    await this.evaluate(code);
     log('Плагин загружен: Упорядочить → Вставить → «Из SQL (ER-диаграмма)…»');
     return true;
   }
@@ -160,7 +161,14 @@ async function main() {
 
   const plugin = path.join(root, 'dist', 'sql-er-plugin.js');
   if (!fs.existsSync(plugin)) throw new Error('Нет dist/sql-er-plugin.js — выполните npm run build');
-  const code = fs.readFileSync(plugin, 'utf8');
+  // Сборку перечитываем, когда файл изменился (npm run build при открытом draw.io),
+  // иначе мост раз за разом возвращал бы в окно версию, с которой был запущен.
+  let cached = { mtime: 0, code: '' };
+  const getCode = () => {
+    const mtime = fs.statSync(plugin).mtimeMs;
+    if (mtime !== cached.mtime) cached = { mtime, code: fs.readFileSync(plugin, 'utf8') };
+    return cached.code;
+  };
 
   const running = await targets().catch(() => null);
   if (running) {
@@ -202,7 +210,7 @@ async function main() {
         s = null;
       }
       if (!s) {
-        s = new PageSession(t, code);
+        s = new PageSession(t, getCode);
         try {
           await s.setup();
           sessions.set(t.id, s);
