@@ -138,3 +138,74 @@ test('большая схема (80 таблиц, 240 связей): быстр�
     }
   }
 });
+
+// «Перепроложить связи» (page.js) по геометрии страницы: таблицы, строки, линии и
+// сохранённые окна (sqlErVia) — так же, как это делает команда.
+const { routeLinks } = require('../src/routing');
+
+function pageLinks(xml) {
+  const cells = new Map();
+  for (const m of xml.matchAll(/(?:<mxCell id="([^"]+)" value="[^"]*"|<UserObject[^>]* id="([^"]+)"><mxCell) style="([^"]*)" vertex="1" parent="([^"]+)"><mxGeometry x="([\d.-]+)" y="([\d.-]+)" width="([\d.]+)" height="([\d.]+)"/g)) {
+    const id = m[1] || m[2];
+    cells.set(id, { id, style: m[3], parent: m[4], x: +m[5], y: +m[6], w: +m[7], h: +m[8] });
+  }
+  const tables = [...cells.values()].filter(c => /sqlErTable=1/.test(c.style))
+    .map(c => ({ id: c.id, x: c.x, y: c.y, width: c.w, height: c.h }));
+  const tableOf = id => (cells.get(id).parent === '1' ? cells.get(id) : cells.get(cells.get(id).parent));
+  const rowY = id => {
+    const t = tableOf(id);
+    const c = cells.get(id);
+    return c === t ? t.y + t.h / 2 : t.y + c.y + c.h / 2;
+  };
+  const links = [];
+  const points = [];
+  for (const m of xml.matchAll(/<mxCell id="sqler-e\d+" style="([^"]*)" edge="1" parent="1" source="([^"]+)" target="([^"]+)"><mxGeometry relative="1" as="geometry">(.*?)<\/mxGeometry>/g)) {
+    const from = tableOf(m[2]);
+    const via = /sqlErVia=([^;]*)/.exec(m[1]);
+    links.push({ from: from.id, to: tableOf(m[3]).id, key: m[2], sy: rowY(m[2]), ty: rowY(m[3]),
+      via: via ? via[1].split(',').map(v => from.y + Number(v)) : undefined });
+    points.push([...m[4].matchAll(/x="([\d.-]+)" y="([\d.-]+)"/g)].map(p => ({ x: +p[1], y: +p[2] })));
+  }
+  return { tables, links, points };
+}
+
+const round = pts => pts.map(p => ({ x: Math.round(p.x * 100) / 100, y: Math.round(p.y * 100) / 100 }));
+
+test('«Перепроложить связи» сразу после вставки не меняет линии (окна сохраняются в стиле)', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const model = parseSql(fs.readFileSync(path.join(__dirname, '..', 'examples', 'ecommerce.sql'), 'utf8'));
+  for (const groupBy of ['none', 'prefix']) {
+    const xml = toGraphModelXml(model, { groupBy });
+    assert.match(xml, /sqlErVia=/, 'у длинных связей есть окна');
+    const { tables, links, points } = pageLinks(xml);
+    const routes = routeLinks(links, tables);
+    routes.forEach((r, i) => assert.deepEqual(round(r.points), points[i], `связь ${i} (${groupBy})`));
+  }
+});
+
+test('окно заняли передвинутой таблицей — связь идёт коридором, не сквозь таблицу', () => {
+  const m = parseSql(`
+    CREATE TABLE a (id INT PRIMARY KEY);
+    CREATE TABLE b1 (id INT PRIMARY KEY, a_id INT REFERENCES a(id), x TEXT, y TEXT, z TEXT);
+    CREATE TABLE b2 (id INT PRIMARY KEY, a_id INT REFERENCES a(id), x TEXT, y TEXT, z TEXT);
+    CREATE TABLE c (id INT PRIMARY KEY, b1 INT REFERENCES b1(id), b2 INT REFERENCES b2(id), a_id INT REFERENCES a(id));`);
+  const { tables, links } = pageLinks(toGraphModelXml(m));
+  const i = links.findIndex(l => l.via);
+  assert.ok(i >= 0, 'длинная связь с окном');
+  // ставим таблицу среднего столбца прямо на окно
+  const [from0, to0] = [links[i].from, links[i].to].map(id => tables.find(t => t.id === id));
+  const middle = tables.find(t => t.x > from0.x && t.x < to0.x);
+  middle.y = links[i].via[0] - 20;
+  const routes = routeLinks(links, tables);
+  assert.equal(routes[i].via, undefined, 'окно не использовано');
+  const from = tables.find(t => t.id === links[i].from);
+  const to = tables.find(t => t.id === links[i].to);
+  const line = [{ x: from.x + from.width, y: links[i].sy }, ...routes[i].points, { x: to.x, y: links[i].ty }];
+  for (let k = 1; k < line.length; k++) {
+    for (const t of tables) {
+      if (t === from || t === to) continue;
+      assert.ok(!through(line[k - 1], line[k], { x: t.x, y: t.y, w: t.width, h: t.height }), `сквозь ${t.id}`);
+    }
+  }
+});

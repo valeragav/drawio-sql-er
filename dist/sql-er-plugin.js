@@ -1110,6 +1110,7 @@ module.exports = { parseSql, tokenize };
 //     до дорожки в канале у ребёнка, а оттуда — к его строке.
 // Если раскладка оставила для длинной связи «окна» в промежуточных столбцах (link.via),
 // связь идёт через них: в каждом промежуточном канале — своя дорожка-«ступенька».
+// Окно, на место которого передвинули таблицу, не годится — тогда связь идёт коридором.
 // Связи из одной строки (один источник) делят дорожку — «ствол» с ответвлениями,
 // разные источники идут по разным дорожкам. Каналы и коридоры свободны от таблиц,
 // поэтому линии не проходят сквозь таблицы.
@@ -1123,6 +1124,7 @@ const MIN_GAP = 100;
 const TRACK_STEP = 10;    // шаг горизонтальных дорожек в коридоре
 const CLEARANCE = 14;     // отступ коридора от таблиц
 const LOOP_OFFSET = 30;   // петля «ссылка на себя» — слева от таблицы
+const VIA_MARGIN = 6;     // окно не ближе этого к таблице
 
 // Столбцы по фактическому расположению: таблицы, пересекающиеся по X, — в одном столбце.
 // Таблица без связей (например, в сетке под схемой) столбцы не склеивает: если она
@@ -1247,10 +1249,21 @@ function candidateTracks(free) {
 // tables: [{ id, x, y, width, height }] — все таблицы (препятствия и столбцы);
 // links:  [{ from, to, key, sy, ty }] — связи: таблица-родитель, таблица-ребёнок,
 //         ключ источника (строка родителя) и абсолютные Y строк.
-// Возвращает массив (по индексу связи): { points: [{x, y}], exit: 'left'|'right', entry: 'left'|'right' }.
+//         via — Y окон в промежуточных столбцах (необязательно).
+// Возвращает массив (по индексу связи): { points: [{x, y}], exit: 'left'|'right', entry: 'left'|'right',
+// via — Y окон, если связь прошла через них }.
 function routeLinks(links, tables) {
   const linked = new Set(links.flatMap(l => [l.from, l.to]));
   const { columns, columnOf } = deriveColumns(tables, linked);
+
+  // Окна, которые всё ещё свободны (таблицы могли передвинуть).
+  const viaFree = link => hasVia(link, columnOf) && link.via.every((y, k) => {
+    const a = columnOf.get(link.from);
+    const c = a < columnOf.get(link.to) ? a + k + 1 : a - k - 1;
+    return columns[c].tables.every(t => y < t.y - VIA_MARGIN || y > t.y + t.height + VIA_MARGIN);
+  });
+  links = links.map(l => (l.via && !viaFree(l) ? Object.assign({}, l, { via: undefined }) : l));
+
   const lanes = planLanes(links, columnOf);
   const byId = new Map(tables.map(t => [t.id, t]));
 
@@ -1327,7 +1340,7 @@ function routeLinks(links, tables) {
         points.push({ x: lx, y: ys[k] }, { x: lx, y: ys[k + 1] });
         if (k) horizontals.push({ y: ys[k], x1: laneX(uses[k - 1].gap, uses[k - 1].key), x2: lx, key });
       });
-      routes[i] = { points, ...side };
+      routes[i] = { points, via: link.via, ...side };
       continue;
     }
 
@@ -2788,6 +2801,17 @@ function sideStyle(route) {
     `entryX=${entryX};entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;`;
 }
 
+// Окна длинной связи — в стиле линии (Y от верха таблицы-родителя), чтобы
+// «Перепроложить связи» провела её так же, пока окна свободны.
+function viaOffsets(route, fromY) {
+  return route.via ? route.via.map(y => Math.round((y - fromY) * 100) / 100).join(',') : null;
+}
+
+function viaStyle(route, fromY) {
+  const offsets = viaOffsets(route, fromY);
+  return offsets ? `sqlErVia=${offsets};` : '';
+}
+
 function pointsXml(points) {
   if (!points.length) return '';
   // Без округления до целых: центр строки бывает дробным (например, 222.5),
@@ -2839,7 +2863,7 @@ function toGraphModelXml(model, options) {
     const target = (link.childColumn != null && rowIds.get(link.to + '\u0000' + link.childColumn)) || tableIds.get(link.to);
     if (!source || !target) return;
     const route = routes[i];
-    const style = linkStyle(link) + sideStyle(route);
+    const style = linkStyle(link) + sideStyle(route) + viaStyle(route, boxes.get(link.from).y);
     cells.push(`<mxCell id="sqler-e${i}" style="${escapeXml(style)}" edge="1" parent="1" source="${source}" target="${target}">` +
       `<mxGeometry relative="1" as="geometry">${pointsXml(route.points)}</mxGeometry></mxCell>`);
   });
@@ -2847,7 +2871,7 @@ function toGraphModelXml(model, options) {
   return `<mxGraphModel><root>${cells.join('')}</root></mxGraphModel>`;
 }
 
-module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle, schemaGraph, DEFAULTS };
+module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle, viaOffsets, schemaGraph, DEFAULTS };
 
   };
 
@@ -3292,7 +3316,7 @@ module.exports = { toMermaid, mermaidName, mermaidType };
 //   - «Обновить» — привести диаграмму к новой схеме, не двигая существующие таблицы.
 // Таблицы плагина помечены в стиле sqlErTable=1 (и sqlErName=<имя>), связи — sqlErLink=1.
 
-const { toGraphModelXml, sideStyle, schemaGraph, DEFAULTS } = require('./drawio');
+const { toGraphModelXml, sideStyle, viaOffsets, schemaGraph, DEFAULTS } = require('./drawio');
 const { routeLinks } = require('./routing');
 const { placeNewTables } = require('./placement');
 const { selectTables } = require('./select');
@@ -3368,14 +3392,19 @@ function reroute(ui) {
 
   const links = [];
   const edges = [];
+  const fromY = [];
   for (const e of linksOf(layer)) {
     const s = model.getTerminal(e, true);
     const t = model.getTerminal(e, false);
     const ts = tableOf(s);
     const tt = tableOf(t);
     if (!ts || !tt || model.getParent(ts) !== layer || model.getParent(tt) !== layer) continue;
-    links.push({ from: ts.id, to: tt.id, key: s.id, sy: rowY(s, ts), ty: rowY(t, tt) });
+    // Окна длинной связи, сохранённые при вставке (Y от верха таблицы-родителя).
+    const via = styleValue(model.getStyle(e), 'sqlErVia');
+    links.push({ from: ts.id, to: tt.id, key: s.id, sy: rowY(s, ts), ty: rowY(t, tt),
+      via: via ? via.split(',').map(v => geo(ts).y + Number(v)) : undefined });
     edges.push(e);
+    fromY.push(geo(ts).y);
   }
   if (!links.length) return 0;
 
@@ -3390,6 +3419,7 @@ function reroute(ui) {
         const [key, value] = pair.split('=');
         style = mxUtils.setStyle(style, key, value);
       }
+      style = mxUtils.setStyle(style, 'sqlErVia', viaOffsets(route, fromY[i]));
       model.setStyle(e, style);
       const g = geo(e).clone();
       const o = originOf(model.getParent(e), layer);
@@ -4696,6 +4726,6 @@ if (typeof Draw !== 'undefined' && Draw.loadPlugin) {
 
   };
 
-  if (typeof window !== 'undefined') window.__sqlErBuild = "79407f68b650";
+  if (typeof window !== 'undefined') window.__sqlErBuild = "5964255dd02a";
   require("plugin");
 })();

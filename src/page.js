@@ -5,7 +5,7 @@
 //   - «Обновить» — привести диаграмму к новой схеме, не двигая существующие таблицы.
 // Таблицы плагина помечены в стиле sqlErTable=1 (и sqlErName=<имя>), связи — sqlErLink=1.
 
-const { toGraphModelXml, sideStyle, schemaGraph, DEFAULTS } = require('./drawio');
+const { toGraphModelXml, sideStyle, viaOffsets, schemaGraph, DEFAULTS } = require('./drawio');
 const { routeLinks } = require('./routing');
 const { placeNewTables } = require('./placement');
 const { selectTables } = require('./select');
@@ -81,14 +81,19 @@ function reroute(ui) {
 
   const links = [];
   const edges = [];
+  const fromY = [];
   for (const e of linksOf(layer)) {
     const s = model.getTerminal(e, true);
     const t = model.getTerminal(e, false);
     const ts = tableOf(s);
     const tt = tableOf(t);
     if (!ts || !tt || model.getParent(ts) !== layer || model.getParent(tt) !== layer) continue;
-    links.push({ from: ts.id, to: tt.id, key: s.id, sy: rowY(s, ts), ty: rowY(t, tt) });
+    // Окна длинной связи, сохранённые при вставке (Y от верха таблицы-родителя).
+    const via = styleValue(model.getStyle(e), 'sqlErVia');
+    links.push({ from: ts.id, to: tt.id, key: s.id, sy: rowY(s, ts), ty: rowY(t, tt),
+      via: via ? via.split(',').map(v => geo(ts).y + Number(v)) : undefined });
     edges.push(e);
+    fromY.push(geo(ts).y);
   }
   if (!links.length) return 0;
 
@@ -103,6 +108,7 @@ function reroute(ui) {
         const [key, value] = pair.split('=');
         style = mxUtils.setStyle(style, key, value);
       }
+      style = mxUtils.setStyle(style, 'sqlErVia', viaOffsets(route, fromY[i]));
       model.setStyle(e, style);
       const g = geo(e).clone();
       const o = originOf(model.getParent(e), layer);

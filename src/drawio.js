@@ -305,6 +305,17 @@ function sideStyle(route) {
     `entryX=${entryX};entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;`;
 }
 
+// Окна длинной связи — в стиле линии (Y от верха таблицы-родителя), чтобы
+// «Перепроложить связи» провела её так же, пока окна свободны.
+function viaOffsets(route, fromY) {
+  return route.via ? route.via.map(y => Math.round((y - fromY) * 100) / 100).join(',') : null;
+}
+
+function viaStyle(route, fromY) {
+  const offsets = viaOffsets(route, fromY);
+  return offsets ? `sqlErVia=${offsets};` : '';
+}
+
 function pointsXml(points) {
   if (!points.length) return '';
   // Без округления до целых: центр строки бывает дробным (например, 222.5),
@@ -356,7 +367,7 @@ function toGraphModelXml(model, options) {
     const target = (link.childColumn != null && rowIds.get(link.to + '\u0000' + link.childColumn)) || tableIds.get(link.to);
     if (!source || !target) return;
     const route = routes[i];
-    const style = linkStyle(link) + sideStyle(route);
+    const style = linkStyle(link) + sideStyle(route) + viaStyle(route, boxes.get(link.from).y);
     cells.push(`<mxCell id="sqler-e${i}" style="${escapeXml(style)}" edge="1" parent="1" source="${source}" target="${target}">` +
       `<mxGeometry relative="1" as="geometry">${pointsXml(route.points)}</mxGeometry></mxCell>`);
   });
@@ -364,4 +375,4 @@ function toGraphModelXml(model, options) {
   return `<mxGraphModel><root>${cells.join('')}</root></mxGraphModel>`;
 }
 
-module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle, schemaGraph, DEFAULTS };
+module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle, viaOffsets, schemaGraph, DEFAULTS };

@@ -11,6 +11,7 @@
 //     до дорожки в канале у ребёнка, а оттуда — к его строке.
 // Если раскладка оставила для длинной связи «окна» в промежуточных столбцах (link.via),
 // связь идёт через них: в каждом промежуточном канале — своя дорожка-«ступенька».
+// Окно, на место которого передвинули таблицу, не годится — тогда связь идёт коридором.
 // Связи из одной строки (один источник) делят дорожку — «ствол» с ответвлениями,
 // разные источники идут по разным дорожкам. Каналы и коридоры свободны от таблиц,
 // поэтому линии не проходят сквозь таблицы.
@@ -24,6 +25,7 @@ const MIN_GAP = 100;
 const TRACK_STEP = 10;    // шаг горизонтальных дорожек в коридоре
 const CLEARANCE = 14;     // отступ коридора от таблиц
 const LOOP_OFFSET = 30;   // петля «ссылка на себя» — слева от таблицы
+const VIA_MARGIN = 6;     // окно не ближе этого к таблице
 
 // Столбцы по фактическому расположению: таблицы, пересекающиеся по X, — в одном столбце.
 // Таблица без связей (например, в сетке под схемой) столбцы не склеивает: если она
@@ -148,10 +150,21 @@ function candidateTracks(free) {
 // tables: [{ id, x, y, width, height }] — все таблицы (препятствия и столбцы);
 // links:  [{ from, to, key, sy, ty }] — связи: таблица-родитель, таблица-ребёнок,
 //         ключ источника (строка родителя) и абсолютные Y строк.
-// Возвращает массив (по индексу связи): { points: [{x, y}], exit: 'left'|'right', entry: 'left'|'right' }.
+//         via — Y окон в промежуточных столбцах (необязательно).
+// Возвращает массив (по индексу связи): { points: [{x, y}], exit: 'left'|'right', entry: 'left'|'right',
+// via — Y окон, если связь прошла через них }.
 function routeLinks(links, tables) {
   const linked = new Set(links.flatMap(l => [l.from, l.to]));
   const { columns, columnOf } = deriveColumns(tables, linked);
+
+  // Окна, которые всё ещё свободны (таблицы могли передвинуть).
+  const viaFree = link => hasVia(link, columnOf) && link.via.every((y, k) => {
+    const a = columnOf.get(link.from);
+    const c = a < columnOf.get(link.to) ? a + k + 1 : a - k - 1;
+    return columns[c].tables.every(t => y < t.y - VIA_MARGIN || y > t.y + t.height + VIA_MARGIN);
+  });
+  links = links.map(l => (l.via && !viaFree(l) ? Object.assign({}, l, { via: undefined }) : l));
+
   const lanes = planLanes(links, columnOf);
   const byId = new Map(tables.map(t => [t.id, t]));
 
@@ -228,7 +241,7 @@ function routeLinks(links, tables) {
         points.push({ x: lx, y: ys[k] }, { x: lx, y: ys[k + 1] });
         if (k) horizontals.push({ y: ys[k], x1: laneX(uses[k - 1].gap, uses[k - 1].key), x2: lx, key });
       });
-      routes[i] = { points, ...side };
+      routes[i] = { points, via: link.via, ...side };
       continue;
     }
 
