@@ -1,12 +1,13 @@
 'use strict';
 
 // Плагин draw.io: «Упорядочить → Вставить → Из SQL (ER-диаграмма)…».
-// Окно: источник SQL (вставить / файл / база PostgreSQL) → поле с DDL → «Вставить»
-// строит таблицы и связи на текущей странице.
+// Окно: источник SQL (вставить / файл / база PostgreSQL) → поле с DDL →
+// «Вставить» (новая диаграмма) или «Обновить на странице» (привести уже вставленную
+// диаграмму к новой схеме, не двигая таблицы).
 
 const { parseSql } = require('./parser');
-const { toGraphModelXml, sideStyle } = require('./drawio');
-const { routeLinks } = require('./routing');
+const { toGraphModelXml } = require('./drawio');
+const { reroute, updatePage } = require('./page');
 
 const ACTION = 'sqlErImport';
 const REROUTE = 'sqlErReroute';
@@ -14,7 +15,9 @@ const REROUTE = 'sqlErReroute';
 function register(ui) {
   installBridgeResponse();
   addAction(ui, ACTION, 'Из SQL (ER-диаграмма)...', () => showDialog(ui), 'insert');
-  addAction(ui, REROUTE, 'Перепроложить связи (SQL ER)', () => reroute(ui), 'arrange');
+  addAction(ui, REROUTE, 'Перепроложить связи (SQL ER)', () => {
+    if (!reroute(ui)) mxUtils.alert('На странице нет связей, построенных плагином «Из SQL (ER-диаграмма)».');
+  }, 'arrange');
 }
 
 // Добавляет действие и пункт меню. При повторной загрузке плагина (обновлённая сборка)
@@ -35,77 +38,6 @@ function addAction(ui, name, label, funct, menuName) {
       original.apply(this, arguments);
       ui.menus.addMenuItems(m, ['-', name], parent);
     };
-  }
-}
-
-// -------------------------------------------------- «Перепроложить связи»
-//
-// После того как таблицы передвинули, у связей остаются изломы на старых местах.
-// Берём текущие положения таблиц, построенных плагином (sqlErTable=1), и заново
-// прокладываем все их связи (sqlErLink=1) той же трассировкой. Одна операция — один Ctrl+Z.
-
-const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
-
-function reroute(ui) {
-  const graph = ui.editor.graph;
-  const model = graph.getModel();
-  const layer = graph.getDefaultParent();
-
-  const isTable = c => model.isVertex(c) && hasFlag(model.getStyle(c), 'sqlErTable');
-  const tableOf = cell => {
-    let c = cell;
-    while (c && !isTable(c)) c = model.getParent(c);
-    return c;
-  };
-  const geo = c => model.getGeometry(c);
-
-  const tableCells = graph.getChildVertices(layer).filter(isTable);
-  const tables = tableCells.map(c => ({ id: c.id, x: geo(c).x, y: geo(c).y, width: geo(c).width, height: geo(c).height }));
-
-  // Y середины строки (или середины таблицы, если связь к самой таблице).
-  const rowY = (row, table) => {
-    const t = geo(table);
-    if (row === table) return t.y + t.height / 2;
-    const r = geo(row);
-    return t.y + r.y + r.height / 2;
-  };
-
-  const links = [];
-  const edges = [];
-  for (const e of graph.getChildEdges(layer)) {
-    if (!hasFlag(model.getStyle(e), 'sqlErLink')) continue;
-    const s = model.getTerminal(e, true);
-    const t = model.getTerminal(e, false);
-    const ts = tableOf(s);
-    const tt = tableOf(t);
-    if (!ts || !tt || ts.parent !== layer || tt.parent !== layer) continue;
-    links.push({ from: ts.id, to: tt.id, key: s.id, sy: rowY(s, ts), ty: rowY(t, tt) });
-    edges.push(e);
-  }
-
-  if (!links.length) {
-    mxUtils.alert('На странице нет связей, построенных плагином «Из SQL (ER-диаграмма)».');
-    return;
-  }
-
-  const routes = routeLinks(links, tables);
-
-  model.beginUpdate();
-  try {
-    edges.forEach((e, i) => {
-      const route = routes[i];
-      let style = model.getStyle(e);
-      for (const pair of sideStyle(route).split(';').filter(Boolean)) {
-        const [key, value] = pair.split('=');
-        style = mxUtils.setStyle(style, key, value);
-      }
-      model.setStyle(e, style);
-      const g = geo(e).clone();
-      g.points = route.points.map(p => new mxPoint(p.x, p.y));
-      model.setGeometry(e, g);
-    });
-  } finally {
-    model.endUpdate();
   }
 }
 
@@ -386,26 +318,53 @@ function showDialog(ui) {
   const cancelBtn = mxUtils.button(mxResources.get('cancel') || 'Отмена', () => ui.hideDialog());
   cancelBtn.className = 'geBtn';
 
-  const insertBtn = mxUtils.button('Вставить', () => {
+  const parsed = () => {
     const model = parseSql(textarea.value);
     if (!model.tables.length) {
       status.textContent = 'В SQL не найдено ни одного CREATE TABLE';
-      return;
+      return null;
     }
-    const xml = toGraphModelXml(model, {
-      detail: detailBox.checked ? 'sql' : 'tags',
-      showNullable: nullableBox.checked,
-      showIndexes: indexesBox.checked
-    });
-    insertXml(ui, xml, replaceBox.checked);
-    ui.hideDialog();
     if (model.warnings.length && typeof console !== 'undefined') {
       console.warn('[sql-er] ' + model.warnings.join('\n[sql-er] '));
     }
+    return model;
+  };
+  const renderOptions = () => ({
+    detail: detailBox.checked ? 'sql' : 'tags',
+    showNullable: nullableBox.checked,
+    showIndexes: indexesBox.checked
+  });
+
+  const insertBtn = mxUtils.button('Вставить', () => {
+    const model = parsed();
+    if (!model) return;
+    insertXml(ui, toGraphModelXml(model, renderOptions()), replaceBox.checked);
+    ui.hideDialog();
   });
   insertBtn.className = 'geBtn gePrimaryBtn';
 
+  // Обновить уже вставленную диаграмму: таблицы остаются на местах, меняется содержимое.
+  const updateBtn = mxUtils.button('Обновить на странице', () => {
+    const model = parsed();
+    if (!model) return;
+    const res = updatePage(ui, model, renderOptions());
+    if (res.error) {
+      status.textContent = '✖ ' + res.error;
+      return;
+    }
+    ui.hideDialog();
+    const parts = [`обновлено таблиц: ${res.updated}`];
+    if (res.added) parts.push(`добавлено: ${res.added} (выделены)`);
+    if (res.restored) parts.push(`вернулось в схему: ${res.restored}`);
+    if (res.removed) parts.push(`нет в схеме: ${res.removed} — помечены пунктиром, удалите сами, если не нужны`);
+    parts.push(`связей: ${res.links}`);
+    mxUtils.alert('Диаграмма обновлена: ' + parts.join(', ') + '.');
+  });
+  updateBtn.className = 'geBtn';
+  updateBtn.title = 'Привести уже вставленную диаграмму к этой схеме, не двигая таблицы (одна операция, Ctrl+Z)';
+
   buttons.appendChild(cancelBtn);
+  buttons.appendChild(updateBtn);
   buttons.appendChild(insertBtn);
   div.appendChild(buttons);
 

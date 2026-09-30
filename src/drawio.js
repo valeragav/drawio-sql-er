@@ -367,7 +367,9 @@ function toGraphModelXml(model, options) {
   for (const box of boxes.values()) {
     const tableId = 'sqler-t' + t++;
     tableIds.set(box.table.name, tableId);
-    cells.push(vertex(tableId, '1', box.table.name, TABLE_STYLE, box.x, box.y, box.width, box.height));
+    // sqlErName — имя таблицы для режима «Обновить» (подпись пользователь может поменять).
+    const tableStyle = TABLE_STYLE + 'sqlErName=' + encodeURIComponent(box.table.name) + ';';
+    cells.push(vertex(tableId, '1', box.table.name, tableStyle, box.x, box.y, box.width, box.height));
     box.rows.forEach((row, i) => {
       const rowId = tableId + '-r' + i;
       if (row.column) rowIds.set(box.table.name + '\u0000' + row.column, rowId);

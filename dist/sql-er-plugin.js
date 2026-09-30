@@ -892,6 +892,78 @@ module.exports = { routeLinks, planLanes, gapWidth, deriveColumns };
 
   };
 
+  defs["placement"] = function (module, exports, require) {
+'use strict';
+
+// Куда поставить новые таблицы при обновлении диаграммы, не двигая существующие.
+//
+// Новая таблица встаёт:
+//   - справа от своего родителя (таблицы, на которую ссылается), если он уже на странице;
+//   - иначе слева от своего ребёнка (таблицы, которая ссылается на неё);
+//   - иначе под всей диаграммой.
+// Если место занято — сдвигается вниз, пока не найдёт свободное.
+// Сначала ставятся таблицы, у которых соседи уже на странице, — от них потом цепляются остальные.
+
+const H_GAP = 120;
+const V_GAP = 40;
+const STEP = 20;
+const MAX_STEPS = 400;
+
+const overlaps = (a, b) =>
+  a.x < b.x + b.width + V_GAP && b.x < a.x + a.width + V_GAP &&
+  a.y < b.y + b.height + V_GAP && b.y < a.y + a.height + V_GAP;
+
+// existing: [{ name, x, y, width, height }] — таблицы, которые остаются на месте;
+// incoming: [{ name, width, height }] — новые таблицы;
+// relations: [{ parent, child }] — связи по именам таблиц.
+// Возвращает Map: имя новой таблицы → { x, y }.
+function placeNewTables(existing, incoming, relations) {
+  const placed = new Map(existing.map(t => [t.name, t]));
+  const occupied = existing.slice();
+  const result = new Map();
+
+  const parentsOf = name => relations.filter(r => r.child === name && r.parent !== name).map(r => r.parent);
+  const childrenOf = name => relations.filter(r => r.parent === name && r.child !== name).map(r => r.child);
+
+  const bottom = () => occupied.length ? Math.max(...occupied.map(t => t.y + t.height)) : 0;
+  const left = () => occupied.length ? Math.min(...occupied.map(t => t.x)) : 0;
+
+  function freeSpot(box) {
+    for (let k = 0; k < MAX_STEPS; k++) {
+      const candidate = { ...box, y: box.y + k * STEP };
+      if (!occupied.some(o => overlaps(candidate, o))) return candidate;
+    }
+    return { ...box, y: bottom() + V_GAP * 2 };
+  }
+
+  const pending = incoming.slice();
+  while (pending.length) {
+    // Таблица, у которой есть уже поставленный сосед; если таких нет — первая по порядку.
+    let index = pending.findIndex(t =>
+      parentsOf(t.name).some(p => placed.has(p)) || childrenOf(t.name).some(c => placed.has(c)));
+    if (index < 0) index = 0;
+    const table = pending.splice(index, 1)[0];
+
+    const parent = parentsOf(table.name).map(p => placed.get(p)).find(Boolean);
+    const child = childrenOf(table.name).map(c => placed.get(c)).find(Boolean);
+
+    let start;
+    if (parent) start = { x: parent.x + parent.width + H_GAP, y: parent.y };
+    else if (child) start = { x: child.x - table.width - H_GAP, y: child.y };
+    else start = { x: left(), y: bottom() + V_GAP * 2 };
+
+    const spot = freeSpot({ name: table.name, x: start.x, y: start.y, width: table.width, height: table.height });
+    placed.set(table.name, spot);
+    occupied.push(spot);
+    result.set(table.name, { x: spot.x, y: spot.y });
+  }
+  return result;
+}
+
+module.exports = { placeNewTables };
+
+  };
+
   defs["drawio"] = function (module, exports, require) {
 'use strict';
 
@@ -1262,7 +1334,9 @@ function toGraphModelXml(model, options) {
   for (const box of boxes.values()) {
     const tableId = 'sqler-t' + t++;
     tableIds.set(box.table.name, tableId);
-    cells.push(vertex(tableId, '1', box.table.name, TABLE_STYLE, box.x, box.y, box.width, box.height));
+    // sqlErName — имя таблицы для режима «Обновить» (подпись пользователь может поменять).
+    const tableStyle = TABLE_STYLE + 'sqlErName=' + encodeURIComponent(box.table.name) + ';';
+    cells.push(vertex(tableId, '1', box.table.name, tableStyle, box.x, box.y, box.width, box.height));
     box.rows.forEach((row, i) => {
       const rowId = tableId + '-r' + i;
       if (row.column) rowIds.set(box.table.name + '\u0000' + row.column, rowId);
@@ -1287,16 +1361,283 @@ module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle };
 
   };
 
+  defs["page"] = function (module, exports, require) {
+'use strict';
+
+// Операции над таблицами и связями, уже стоящими на странице draw.io:
+//   - «Перепроложить связи» — заново проложить линии по текущим положениям таблиц;
+//   - «Обновить» — привести диаграмму к новой схеме, не двигая существующие таблицы.
+// Таблицы плагина помечены в стиле sqlErTable=1 (и sqlErName=<имя>), связи — sqlErLink=1.
+
+const { toGraphModelXml, sideStyle } = require('./drawio');
+const { routeLinks } = require('./routing');
+const { placeNewTables } = require('./placement');
+
+const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
+
+function styleValue(style, key) {
+  const m = new RegExp('(?:^|;)' + key + '=([^;]*)').exec(style || '');
+  return m ? m[1] : null;
+}
+
+function helpers(graph) {
+  const model = graph.getModel();
+  const isTable = c => model.isVertex(c) && hasFlag(model.getStyle(c), 'sqlErTable');
+  const isLink = c => model.isEdge(c) && hasFlag(model.getStyle(c), 'sqlErLink');
+  const tableOf = cell => {
+    let c = cell;
+    while (c && !isTable(c)) c = model.getParent(c);
+    return c;
+  };
+  // Имя таблицы: из метки sqlErName, для старых диаграмм — из подписи.
+  const nameOf = c => {
+    const encoded = styleValue(model.getStyle(c), 'sqlErName');
+    if (encoded) {
+      try { return decodeURIComponent(encoded); } catch (e) { /* ниже — подпись */ }
+    }
+    return String(graph.convertValueToString(c) || '');
+  };
+  // Все связи плагина на странице. Связь, у которой оба конца в одной таблице (ссылка
+  // на себя), draw.io кладёт внутрь этой таблицы — поэтому ищем по всем потомкам слоя.
+  const linksOf = layer => model.getDescendants(layer).filter(isLink);
+  // Начало координат ячейки-родителя относительно слоя (точки связи задаются в нём).
+  const originOf = (cell, layer) => {
+    let x = 0;
+    let y = 0;
+    for (let c = cell; c && c !== layer; c = model.getParent(c)) {
+      const g = model.getGeometry(c);
+      if (g && !g.relative) {
+        x += g.x;
+        y += g.y;
+      }
+    }
+    return { x, y };
+  };
+  return { model, isTable, isLink, tableOf, nameOf, linksOf, originOf, geo: c => model.getGeometry(c) };
+}
+
+// -------------------------------------------------- «Перепроложить связи»
+
+// Заново прокладывает все связи плагина на текущей странице. Возвращает число связей.
+function reroute(ui) {
+  const graph = ui.editor.graph;
+  const layer = graph.getDefaultParent();
+  const { model, isTable, tableOf, linksOf, originOf, geo } = helpers(graph);
+
+  const tables = graph.getChildVertices(layer).filter(isTable)
+    .map(c => ({ id: c.id, x: geo(c).x, y: geo(c).y, width: geo(c).width, height: geo(c).height }));
+
+  // Y середины строки (или середины таблицы, если связь к самой таблице).
+  const rowY = (row, table) => {
+    const t = geo(table);
+    if (row === table) return t.y + t.height / 2;
+    const r = geo(row);
+    return t.y + r.y + r.height / 2;
+  };
+
+  const links = [];
+  const edges = [];
+  for (const e of linksOf(layer)) {
+    const s = model.getTerminal(e, true);
+    const t = model.getTerminal(e, false);
+    const ts = tableOf(s);
+    const tt = tableOf(t);
+    if (!ts || !tt || model.getParent(ts) !== layer || model.getParent(tt) !== layer) continue;
+    links.push({ from: ts.id, to: tt.id, key: s.id, sy: rowY(s, ts), ty: rowY(t, tt) });
+    edges.push(e);
+  }
+  if (!links.length) return 0;
+
+  const routes = routeLinks(links, tables);
+
+  model.beginUpdate();
+  try {
+    edges.forEach((e, i) => {
+      const route = routes[i];
+      let style = model.getStyle(e);
+      for (const pair of sideStyle(route).split(';').filter(Boolean)) {
+        const [key, value] = pair.split('=');
+        style = mxUtils.setStyle(style, key, value);
+      }
+      model.setStyle(e, style);
+      const g = geo(e).clone();
+      const o = originOf(model.getParent(e), layer);
+      g.points = route.points.map(p => new mxPoint(p.x - o.x, p.y - o.y));
+      model.setGeometry(e, g);
+    });
+  } finally {
+    model.endUpdate();
+  }
+  return links.length;
+}
+
+// ------------------------------------------------------------- «Обновить»
+
+// Приводит таблицы плагина на текущей странице к схеме model:
+//   - существующие таблицы остаются на месте, у них заменяются строки (колонки,
+//     ограничения, индексы); ручные правки стиля таблицы сохраняются;
+//   - новые таблицы ставятся рядом со связанными;
+//   - таблицы, которых нет в схеме, помечаются (пунктир, полупрозрачно), а не удаляются;
+//   - связи пересобираются и перепрокладываются.
+// Всё — одна операция (один Ctrl+Z). Возвращает сводку или { error }.
+function updatePage(ui, schema, opts) {
+  const graph = ui.editor.graph;
+  const layer = graph.getDefaultParent();
+  const { model, isTable, nameOf, linksOf, geo } = helpers(graph);
+
+  const pageTables = new Map();
+  for (const c of graph.getChildVertices(layer)) {
+    if (isTable(c)) pageTables.set(nameOf(c), c);
+  }
+  if (!pageTables.size) {
+    return { error: 'На странице нет таблиц, вставленных плагином, — используйте «Вставить».' };
+  }
+
+  // Свежая диаграмма по новой схеме — из неё берём строки, размеры и связи.
+  const doc = mxUtils.parseXml(toGraphModelXml(schema, opts));
+  const fresh = new mxGraphModel();
+  new mxCodec(doc).decode(doc.documentElement, fresh);
+  const freshLayer = fresh.getChildAt(fresh.getRoot(), 0);
+  const freshCells = fresh.getChildren(freshLayer) || [];
+  const freshTables = new Map();
+  for (const c of freshCells) {
+    if (fresh.isVertex(c)) freshTables.set(decodeURIComponent(styleValue(fresh.getStyle(c), 'sqlErName')), c);
+  }
+  const freshEdges = freshCells.filter(c => fresh.isEdge(c));
+
+  // Места для новых таблиц.
+  const existing = [];
+  for (const [name, cell] of pageTables) {
+    if (freshTables.has(name)) {
+      const g = geo(cell);
+      existing.push({ name, x: g.x, y: g.y, width: g.width, height: g.height });
+    }
+  }
+  const incoming = [...freshTables]
+    .filter(([name]) => !pageTables.has(name))
+    .map(([name, cell]) => ({ name, width: fresh.getGeometry(cell).width, height: fresh.getGeometry(cell).height }));
+  const positions = placeNewTables(existing, incoming, schema.relations);
+
+  const summary = { updated: 0, added: 0, removed: 0, restored: 0, links: 0 };
+  const result = new Map(); // имя → таблица на странице
+  const addedCells = [];
+
+  model.beginUpdate();
+  try {
+    // Старые связи плагина удаляем — ниже построим по новой схеме.
+    for (const e of linksOf(layer)) model.remove(e);
+
+    for (const [name, freshTable] of freshTables) {
+      const rows = fresh.getChildren(freshTable) || [];
+      const fg = fresh.getGeometry(freshTable);
+      let table = pageTables.get(name);
+
+      if (table) {
+        // Существующая таблица: место и стиль те же, строки — новые.
+        if (hasFlag(model.getStyle(table), 'sqlErRemoved')) {
+          model.setStyle(table, unmarkRemoved(model.getStyle(table)));
+          summary.restored++;
+        }
+        let style = model.getStyle(table);
+        style = mxUtils.setStyle(style, 'sqlErTable', '1');
+        style = mxUtils.setStyle(style, 'sqlErName', encodeURIComponent(name));
+        model.setStyle(table, style);
+
+        for (const child of (model.getChildren(table) || []).slice()) model.remove(child);
+        const g = geo(table).clone();
+        g.width = Math.max(g.width, fg.width);
+        g.height = fg.height;
+        model.setGeometry(table, g);
+        rows.forEach((row, i) => model.add(table, cloneRow(row, g.width), i));
+        summary.updated++;
+      } else {
+        // Новая таблица — рядом со связанными.
+        table = freshTable.clone();
+        const g = fg.clone();
+        const pos = positions.get(name);
+        g.x = pos.x;
+        g.y = pos.y;
+        table.setGeometry(g);
+        model.add(layer, table);
+        rows.forEach((row, i) => model.add(table, cloneRow(row, g.width), i));
+        addedCells.push(table);
+        summary.added++;
+      }
+      result.set(name, table);
+    }
+
+    // Таблицы, которых нет в новой схеме, — пометить, не удалять.
+    for (const [name, table] of pageTables) {
+      if (freshTables.has(name) || hasFlag(model.getStyle(table), 'sqlErRemoved')) continue;
+      model.setStyle(table, markRemoved(model.getStyle(table)));
+      summary.removed++;
+    }
+
+    // Связи по новой схеме: строка на свежей диаграмме → та же строка (по порядку) на странице.
+    const pageTerminal = freshCell => {
+      const freshTable = fresh.isVertex(fresh.getParent(freshCell)) ? fresh.getParent(freshCell) : freshCell;
+      const name = decodeURIComponent(styleValue(fresh.getStyle(freshTable), 'sqlErName'));
+      const table = result.get(name);
+      if (freshTable === freshCell) return table;
+      return model.getChildAt(table, (fresh.getChildren(freshTable) || []).indexOf(freshCell));
+    };
+    for (const e of freshEdges) {
+      const source = pageTerminal(fresh.getTerminal(e, true));
+      const target = pageTerminal(fresh.getTerminal(e, false));
+      if (!source || !target) continue;
+      const edge = new mxCell('', new mxGeometry(), fresh.getStyle(e));
+      edge.setEdge(true);
+      edge.geometry.relative = true;
+      model.add(layer, edge);
+      model.setTerminal(edge, source, true);
+      model.setTerminal(edge, target, false);
+      summary.links++;
+    }
+
+    reroute(ui);
+  } finally {
+    model.endUpdate();
+  }
+
+  if (addedCells.length) graph.setSelectionCells(addedCells);
+  return summary;
+}
+
+function cloneRow(row, width) {
+  const copy = row.clone();
+  const g = copy.getGeometry().clone();
+  g.width = width;
+  copy.setGeometry(g);
+  return copy;
+}
+
+function markRemoved(style) {
+  style = mxUtils.setStyle(style, 'dashed', '1');
+  style = mxUtils.setStyle(style, 'opacity', '50');
+  style = mxUtils.setStyle(style, 'textOpacity', '50');
+  return mxUtils.setStyle(style, 'sqlErRemoved', '1');
+}
+
+function unmarkRemoved(style) {
+  for (const key of ['dashed', 'opacity', 'textOpacity', 'sqlErRemoved']) style = mxUtils.setStyle(style, key, null);
+  return style;
+}
+
+module.exports = { reroute, updatePage };
+
+  };
+
   defs["plugin"] = function (module, exports, require) {
 'use strict';
 
 // Плагин draw.io: «Упорядочить → Вставить → Из SQL (ER-диаграмма)…».
-// Окно: источник SQL (вставить / файл / база PostgreSQL) → поле с DDL → «Вставить»
-// строит таблицы и связи на текущей странице.
+// Окно: источник SQL (вставить / файл / база PostgreSQL) → поле с DDL →
+// «Вставить» (новая диаграмма) или «Обновить на странице» (привести уже вставленную
+// диаграмму к новой схеме, не двигая таблицы).
 
 const { parseSql } = require('./parser');
-const { toGraphModelXml, sideStyle } = require('./drawio');
-const { routeLinks } = require('./routing');
+const { toGraphModelXml } = require('./drawio');
+const { reroute, updatePage } = require('./page');
 
 const ACTION = 'sqlErImport';
 const REROUTE = 'sqlErReroute';
@@ -1304,7 +1645,9 @@ const REROUTE = 'sqlErReroute';
 function register(ui) {
   installBridgeResponse();
   addAction(ui, ACTION, 'Из SQL (ER-диаграмма)...', () => showDialog(ui), 'insert');
-  addAction(ui, REROUTE, 'Перепроложить связи (SQL ER)', () => reroute(ui), 'arrange');
+  addAction(ui, REROUTE, 'Перепроложить связи (SQL ER)', () => {
+    if (!reroute(ui)) mxUtils.alert('На странице нет связей, построенных плагином «Из SQL (ER-диаграмма)».');
+  }, 'arrange');
 }
 
 // Добавляет действие и пункт меню. При повторной загрузке плагина (обновлённая сборка)
@@ -1325,77 +1668,6 @@ function addAction(ui, name, label, funct, menuName) {
       original.apply(this, arguments);
       ui.menus.addMenuItems(m, ['-', name], parent);
     };
-  }
-}
-
-// -------------------------------------------------- «Перепроложить связи»
-//
-// После того как таблицы передвинули, у связей остаются изломы на старых местах.
-// Берём текущие положения таблиц, построенных плагином (sqlErTable=1), и заново
-// прокладываем все их связи (sqlErLink=1) той же трассировкой. Одна операция — один Ctrl+Z.
-
-const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
-
-function reroute(ui) {
-  const graph = ui.editor.graph;
-  const model = graph.getModel();
-  const layer = graph.getDefaultParent();
-
-  const isTable = c => model.isVertex(c) && hasFlag(model.getStyle(c), 'sqlErTable');
-  const tableOf = cell => {
-    let c = cell;
-    while (c && !isTable(c)) c = model.getParent(c);
-    return c;
-  };
-  const geo = c => model.getGeometry(c);
-
-  const tableCells = graph.getChildVertices(layer).filter(isTable);
-  const tables = tableCells.map(c => ({ id: c.id, x: geo(c).x, y: geo(c).y, width: geo(c).width, height: geo(c).height }));
-
-  // Y середины строки (или середины таблицы, если связь к самой таблице).
-  const rowY = (row, table) => {
-    const t = geo(table);
-    if (row === table) return t.y + t.height / 2;
-    const r = geo(row);
-    return t.y + r.y + r.height / 2;
-  };
-
-  const links = [];
-  const edges = [];
-  for (const e of graph.getChildEdges(layer)) {
-    if (!hasFlag(model.getStyle(e), 'sqlErLink')) continue;
-    const s = model.getTerminal(e, true);
-    const t = model.getTerminal(e, false);
-    const ts = tableOf(s);
-    const tt = tableOf(t);
-    if (!ts || !tt || ts.parent !== layer || tt.parent !== layer) continue;
-    links.push({ from: ts.id, to: tt.id, key: s.id, sy: rowY(s, ts), ty: rowY(t, tt) });
-    edges.push(e);
-  }
-
-  if (!links.length) {
-    mxUtils.alert('На странице нет связей, построенных плагином «Из SQL (ER-диаграмма)».');
-    return;
-  }
-
-  const routes = routeLinks(links, tables);
-
-  model.beginUpdate();
-  try {
-    edges.forEach((e, i) => {
-      const route = routes[i];
-      let style = model.getStyle(e);
-      for (const pair of sideStyle(route).split(';').filter(Boolean)) {
-        const [key, value] = pair.split('=');
-        style = mxUtils.setStyle(style, key, value);
-      }
-      model.setStyle(e, style);
-      const g = geo(e).clone();
-      g.points = route.points.map(p => new mxPoint(p.x, p.y));
-      model.setGeometry(e, g);
-    });
-  } finally {
-    model.endUpdate();
   }
 }
 
@@ -1676,26 +1948,53 @@ function showDialog(ui) {
   const cancelBtn = mxUtils.button(mxResources.get('cancel') || 'Отмена', () => ui.hideDialog());
   cancelBtn.className = 'geBtn';
 
-  const insertBtn = mxUtils.button('Вставить', () => {
+  const parsed = () => {
     const model = parseSql(textarea.value);
     if (!model.tables.length) {
       status.textContent = 'В SQL не найдено ни одного CREATE TABLE';
-      return;
+      return null;
     }
-    const xml = toGraphModelXml(model, {
-      detail: detailBox.checked ? 'sql' : 'tags',
-      showNullable: nullableBox.checked,
-      showIndexes: indexesBox.checked
-    });
-    insertXml(ui, xml, replaceBox.checked);
-    ui.hideDialog();
     if (model.warnings.length && typeof console !== 'undefined') {
       console.warn('[sql-er] ' + model.warnings.join('\n[sql-er] '));
     }
+    return model;
+  };
+  const renderOptions = () => ({
+    detail: detailBox.checked ? 'sql' : 'tags',
+    showNullable: nullableBox.checked,
+    showIndexes: indexesBox.checked
+  });
+
+  const insertBtn = mxUtils.button('Вставить', () => {
+    const model = parsed();
+    if (!model) return;
+    insertXml(ui, toGraphModelXml(model, renderOptions()), replaceBox.checked);
+    ui.hideDialog();
   });
   insertBtn.className = 'geBtn gePrimaryBtn';
 
+  // Обновить уже вставленную диаграмму: таблицы остаются на местах, меняется содержимое.
+  const updateBtn = mxUtils.button('Обновить на странице', () => {
+    const model = parsed();
+    if (!model) return;
+    const res = updatePage(ui, model, renderOptions());
+    if (res.error) {
+      status.textContent = '✖ ' + res.error;
+      return;
+    }
+    ui.hideDialog();
+    const parts = [`обновлено таблиц: ${res.updated}`];
+    if (res.added) parts.push(`добавлено: ${res.added} (выделены)`);
+    if (res.restored) parts.push(`вернулось в схему: ${res.restored}`);
+    if (res.removed) parts.push(`нет в схеме: ${res.removed} — помечены пунктиром, удалите сами, если не нужны`);
+    parts.push(`связей: ${res.links}`);
+    mxUtils.alert('Диаграмма обновлена: ' + parts.join(', ') + '.');
+  });
+  updateBtn.className = 'geBtn';
+  updateBtn.title = 'Привести уже вставленную диаграмму к этой схеме, не двигая таблицы (одна операция, Ctrl+Z)';
+
   buttons.appendChild(cancelBtn);
+  buttons.appendChild(updateBtn);
   buttons.appendChild(insertBtn);
   div.appendChild(buttons);
 
