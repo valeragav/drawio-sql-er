@@ -89,3 +89,69 @@ test('таблица без родителей встаёт рядом со св
   // соседние столбцы: только спуск по дорожке (две точки), без коридора через столбец
   assert.ok(e.points.length <= 2, 'coupons → orders без перескока через столбец');
 });
+
+// Проверка маршрута по «сырым» данным трассировщика: ортогонально и в обход таблиц.
+const { routeLinks } = require('../src/routing');
+
+function checkRoute(route, link, tables) {
+  const from = tables.find(t => t.id === link.from);
+  const to = tables.find(t => t.id === link.to);
+  const start = { x: route.exit === 'right' ? from.x + from.width : from.x, y: link.sy };
+  const end = { x: route.entry === 'right' ? to.x + to.width : to.x, y: link.ty };
+  const line = [start, ...route.points, end];
+  for (let i = 1; i < line.length; i++) {
+    const a = line[i - 1], b = line[i];
+    assert.ok(a.x === b.x || a.y === b.y, `${link.from}→${link.to}: отрезок ${i} косой`);
+    for (const t of tables) {
+      assert.ok(!crosses(a, b, { x: t.x, y: t.y, w: t.width, h: t.height }),
+        `${link.from}→${link.to}: отрезок ${i} проходит сквозь ${t.id}`);
+    }
+  }
+}
+
+test('передвинутые таблицы: ребёнок левее родителя, в том же столбце, через столбец', () => {
+  const tables = [
+    { id: 'parent', x: 600, y: 40, width: 200, height: 150 },
+    { id: 'left_child', x: 40, y: 60, width: 200, height: 120 },
+    { id: 'middle', x: 320, y: 20, width: 200, height: 300 },
+    { id: 'same_col', x: 600, y: 260, width: 200, height: 100 },
+    { id: 'far_right', x: 1200, y: 400, width: 200, height: 100 },
+    { id: 'blocker', x: 900, y: 150, width: 200, height: 400 }
+  ];
+  const links = [
+    { from: 'parent', to: 'left_child', key: 'p.id', sy: 85, ty: 125 },   // справа налево через столбец
+    { from: 'parent', to: 'same_col', key: 'p.id', sy: 85, ty: 305 },     // в том же столбце
+    { from: 'parent', to: 'far_right', key: 'p.id', sy: 85, ty: 445 },    // через столбец с препятствием
+    { from: 'middle', to: 'middle', key: 'm.id', sy: 65, ty: 95 }         // ссылка на себя
+  ];
+  const routes = routeLinks(links, tables);
+  assert.deepEqual(routes.map(r => r.exit + '→' + r.entry), ['left→right', 'right→right', 'right→left', 'left→left']);
+  links.forEach((l, i) => { if (l.from !== l.to) checkRoute(routes[i], l, tables); });
+});
+
+test('составной внешний ключ: основная линия со значками и пунктир для остальных колонок', () => {
+  const m = parseSql(`
+    CREATE TABLE a (x INT, y INT, PRIMARY KEY (x, y));
+    CREATE TABLE b (id INT PRIMARY KEY, ax INT NOT NULL, ay INT NOT NULL,
+      FOREIGN KEY (ax, ay) REFERENCES a (x, y));
+  `);
+  assert.deepEqual(m.relations[0].extraColumns, [{ parentColumn: 'y', childColumn: 'ay' }]);
+  const { edges } = geometry(toGraphModelXml(m));
+  assert.equal(edges.length, 2);
+  const [main, extra] = edges;
+  assert.match(main.style, /startArrow=ERmandOne;endArrow=ERmany/);
+  assert.match(extra.style, /dashed=1/);
+  assert.match(extra.style, /startArrow=none;endArrow=none/);
+  assert.notEqual(main.source.id, extra.source.id, 'пунктир идёт от другой колонки');
+});
+
+test('длинные строки переносятся: таблица не шире предела, строка выше', () => {
+  const long = 'CHECK (' + Array.from({ length: 12 }, (_, i) => `col_${i} > ${i}`).join(' AND ') + ')';
+  const m = parseSql(`CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL ${long});`);
+  const { tables } = geometry(toGraphModelXml(m));
+  assert.ok(tables[0].w <= 480, 'ширина не больше 480');
+  const xml = toGraphModelXml(m);
+  const row = /value="v : INT[^"]*"[^>]*><mxGeometry x="0" y="[\d.]+" width="[\d.]+" height="([\d.]+)"/.exec(xml);
+  assert.ok(+row[1] > 30, 'перенесённая строка выше обычной');
+  assert.match(xml, /whiteSpace=wrap/);
+});

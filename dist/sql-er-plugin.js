@@ -644,7 +644,7 @@ function finalize(state) {
       const oneToOne = sameSet(fk.columns, child.primaryKey) ||
         child.uniques.concat(singleUniques, child.uniqueIndexSets).some(u => sameSet(u, fk.columns));
 
-      relations.push({
+      const relation = {
         parent: parent.name,
         parentColumn: refColumns[0],
         child: child.name,
@@ -652,7 +652,14 @@ function finalize(state) {
         // Может ли у дочерней записи не быть родителя (FK допускает NULL).
         optional: childCols.some(c => !c.notNull),
         oneToOne
-      });
+      };
+      // Составной ключ: остальные пары колонок (рисуются пунктиром рядом с основной линией).
+      if (fk.columns.length > 1) {
+        relation.extraColumns = fk.columns.slice(1)
+          .map((childColumn, k) => ({ parentColumn: refColumns[k + 1], childColumn }))
+          .filter(pair => pair.parentColumn);
+      }
+      relations.push(relation);
     }
   }
 
@@ -687,47 +694,67 @@ module.exports = { parseSql, tokenize };
   defs["routing"] = function (module, exports, require) {
 'use strict';
 
-// Ортогональная трассировка связей между столбцами таблиц.
+// Ортогональная трассировка связей между таблицами.
 //
-// Таблицы стоят столбцами; между соседними столбцами — промежуток («канал»).
-// Связь из строки родителя (столбец a) к строке ребёнка (столбец b > a):
-//   - выходит вправо до своей вертикальной «дорожки» в канале a;
-//   - если b = a + 1 — спускается/поднимается до строки ребёнка и входит слева;
-//   - иначе идёт по горизонтальному «коридору» между таблицами промежуточных
-//     столбцов до дорожки в канале b − 1, а оттуда — к строке ребёнка.
-// Связи из одной и той же строки (один источник) делят дорожку — получается
-// «ствол» с ответвлениями; разные источники идут по разным дорожкам.
+// Таблицы группируются в «столбцы» по фактическому расположению (пересекающиеся по X).
+// Между соседними столбцами — свободный канал, в нём вертикальные «дорожки».
+// Связь из строки родителя в строку ребёнка:
+//   - выходит сбоку до своей дорожки в ближайшем канале;
+//   - если таблицы в соседних столбцах — идёт по дорожке до строки ребёнка и входит сбоку;
+//   - иначе идёт по горизонтальному «коридору» между таблицами промежуточных столбцов
+//     до дорожки в канале у ребёнка, а оттуда — к его строке.
+// Связи из одной строки (один источник) делят дорожку — «ствол» с ответвлениями,
+// разные источники идут по разным дорожкам. Каналы и коридоры свободны от таблиц,
+// поэтому линии не проходят сквозь таблицы.
+//
+// Работает и для только что построенной раскладки, и для таблиц, которые пользователь
+// передвинул (команда «Перепроложить связи»).
 
 const LANE_SPACING = 12;  // расстояние между соседними дорожками в канале
 const GAP_PADDING = 36;   // от таблицы до крайней дорожки (место под значки связи)
 const MIN_GAP = 100;
 const TRACK_STEP = 10;    // шаг горизонтальных дорожек в коридоре
 const CLEARANCE = 14;     // отступ коридора от таблиц
+const LOOP_OFFSET = 30;   // петля «ссылка на себя» — слева от таблицы
 
-const sourceKey = rel => rel.parent + '\u0000' + rel.parentColumn;
+// Столбцы по фактическому расположению: таблицы, пересекающиеся по X, — в одном столбце.
+function deriveColumns(tables) {
+  const sorted = tables.slice().sort((a, b) => a.x - b.x);
+  const columns = [];
+  for (const t of sorted) {
+    const last = columns[columns.length - 1];
+    if (last && t.x < last.right) {
+      last.tables.push(t);
+      last.right = Math.max(last.right, t.x + t.width);
+    } else {
+      columns.push({ left: t.x, right: t.x + t.width, tables: [t] });
+    }
+  }
+  const columnOf = new Map();
+  columns.forEach((c, i) => c.tables.forEach(t => columnOf.set(t.id, i)));
+  return { columns, columnOf };
+}
 
-// Какие связи трассируем: только слева направо (родитель левее ребёнка).
-// Остальные (циклы ссылок, ссылки внутри столбца, на себя) рисуются как раньше.
-function isRoutable(rel, columnOf) {
-  return rel.parent !== rel.child && columnOf.get(rel.parent) < columnOf.get(rel.child);
+// Какие каналы использует связь: номер канала g — промежуток справа от столбца g.
+function gapsOf(link, columnOf) {
+  if (link.from === link.to) return [];
+  const a = columnOf.get(link.from);
+  const b = columnOf.get(link.to);
+  if (a < b) return b - 1 === a ? [a] : [a, b - 1];
+  if (a > b) return a - 1 === b ? [b] : [a - 1, b];
+  return [a];
 }
 
 // Дорожки в каждом канале: ключ источника → номер дорожки.
 // Порядок — по высоте строки-источника, чтобы стволы меньше пересекались.
-function planLanes(relations, columnOf, rowCenter) {
+function planLanes(links, columnOf) {
   const perGap = new Map();
-  const add = (gap, rel) => {
-    if (!perGap.has(gap)) perGap.set(gap, new Map());
-    perGap.get(gap).set(sourceKey(rel), rowCenter(rel.parent, rel.parentColumn));
-  };
-  for (const rel of relations) {
-    if (!isRoutable(rel, columnOf)) continue;
-    const a = columnOf.get(rel.parent);
-    const b = columnOf.get(rel.child);
-    add(a, rel);
-    if (b - 1 !== a) add(b - 1, rel);
+  for (const link of links) {
+    for (const g of gapsOf(link, columnOf)) {
+      if (!perGap.has(g)) perGap.set(g, new Map());
+      perGap.get(g).set(link.key, link.sy);
+    }
   }
-
   const lanes = new Map();
   for (const [gap, keys] of perGap) {
     const ordered = [...keys].sort((p, q) => p[1] - q[1]).map(([k]) => k);
@@ -736,24 +763,23 @@ function planLanes(relations, columnOf, rowCenter) {
   return lanes;
 }
 
+// Ширина канала под заданное число дорожек (для построения раскладки).
 function gapWidth(lanes, gap) {
   const n = lanes.has(gap) ? lanes.get(gap).size : 0;
   return Math.max(MIN_GAP, GAP_PADDING * 2 + Math.max(0, n - 1) * LANE_SPACING);
 }
 
-// Свободные по вертикали интервалы, общие для набора столбцов.
-function freeIntervals(boxesInColumns) {
-  const blocked = boxesInColumns
+// Свободные по вертикали интервалы, общие для набора таблиц.
+function freeIntervals(obstacles) {
+  const blocked = obstacles
     .map(b => [b.y - CLEARANCE, b.y + b.height + CLEARANCE])
     .sort((p, q) => p[0] - q[0]);
-
   const merged = [];
   for (const iv of blocked) {
     const last = merged[merged.length - 1];
     if (last && iv[0] <= last[1]) last[1] = Math.max(last[1], iv[1]);
     else merged.push(iv.slice());
   }
-
   const free = [];
   let lo = -Infinity;
   for (const [s, e] of merged) {
@@ -783,57 +809,86 @@ function candidateTracks(free) {
   return ys;
 }
 
-// columns: массив имён таблиц по столбцам; columnX/columnWidth — геометрия столбцов;
-// boxes: имя → { x, y, width, height }; rowCenter(table, column) → абсолютный y строки.
-// Возвращает Map: индекс связи → массив точек [{x, y}] (или отсутствует — не трассируется).
-function routeRelations(relations, { columns, columnX, columnWidth, boxes, columnOf, rowCenter, lanes }) {
-  const laneX = (gap, key) => columnX[gap] + columnWidth[gap] + GAP_PADDING + lanes.get(gap).get(key) * LANE_SPACING;
+// tables: [{ id, x, y, width, height }] — все таблицы (препятствия и столбцы);
+// links:  [{ from, to, key, sy, ty }] — связи: таблица-родитель, таблица-ребёнок,
+//         ключ источника (строка родителя) и абсолютные Y строк.
+// Возвращает массив (по индексу связи): { points: [{x, y}], exit: 'left'|'right', entry: 'left'|'right' }.
+function routeLinks(links, tables) {
+  const { columns, columnOf } = deriveColumns(tables);
+  const lanes = planLanes(links, columnOf);
+  const byId = new Map(tables.map(t => [t.id, t]));
 
-  const horizontals = []; // занятые горизонтальные отрезки коридоров: { y, x1, x2, key }
+  // Дорожки размещаются в фактической ширине канала; если он узкий — плотнее.
+  const laneX = (gap, key) => {
+    const left = columns[gap].right;
+    const right = gap + 1 < columns.length ? columns[gap + 1].left : left + gapWidth(lanes, gap);
+    const width = right - left;
+    const n = lanes.get(gap).size;
+    const pad = Math.min(GAP_PADDING, width / 4);
+    const spacing = n > 1 ? Math.min(LANE_SPACING, (width - 2 * pad) / (n - 1)) : 0;
+    return left + pad + lanes.get(gap).get(key) * spacing;
+  };
+
+  const horizontals = []; // занятые горизонтальные отрезки коридоров
   const conflicts = (y, x1, x2, key) => horizontals.some(h =>
-    h.key !== key && Math.abs(h.y - y) < TRACK_STEP - 1 && h.x1 < x2 && x1 < h.x2);
+    h.key !== key && Math.abs(h.y - y) < TRACK_STEP - 1 &&
+    Math.min(h.x1, h.x2) < Math.max(x1, x2) && Math.min(x1, x2) < Math.max(h.x1, h.x2));
+
+  function corridor(fromCol, toCol, x1, x2, target, key) {
+    const middle = [];
+    for (let c = Math.min(fromCol, toCol) + 1; c < Math.max(fromCol, toCol); c++) middle.push(...columns[c].tables);
+    const tracks = candidateTracks(freeIntervals(middle))
+      .sort((p, q) => Math.abs(p - target) - Math.abs(q - target));
+    const found = tracks.find(t => !conflicts(t, x1, x2, key));
+    const y = found === undefined ? tracks[0] : found;
+    horizontals.push({ y, x1, x2, key });
+    return y;
+  }
 
   // Сначала короткие связи — им достаются коридоры ближе к прямой линии.
-  const order = relations
-    .map((rel, i) => i)
-    .filter(i => isRoutable(relations[i], columnOf))
-    .sort((i, j) => {
-      const span = k => columnOf.get(relations[k].child) - columnOf.get(relations[k].parent);
-      return span(i) - span(j) || i - j;
-    });
+  const span = l => l.from === l.to ? 0 : Math.abs(columnOf.get(l.to) - columnOf.get(l.from));
+  const order = links.map((l, i) => i).sort((i, j) => span(links[i]) - span(links[j]) || i - j);
 
-  const routes = new Map();
+  const routes = [];
   for (const i of order) {
-    const rel = relations[i];
-    const key = sourceKey(rel);
-    const a = columnOf.get(rel.parent);
-    const b = columnOf.get(rel.child);
-    const sy = rowCenter(rel.parent, rel.parentColumn);
-    const ty = rowCenter(rel.child, rel.childColumn);
-    const x1 = laneX(a, key);
+    const link = links[i];
+    const { sy, ty, key } = link;
 
-    if (b === a + 1) {
-      routes.set(i, sy === ty ? [] : [{ x: x1, y: sy }, { x: x1, y: ty }]);
+    if (link.from === link.to) {
+      const px = byId.get(link.from).x - LOOP_OFFSET;
+      routes[i] = { points: [{ x: px, y: sy }, { x: px, y: ty }], exit: 'left', entry: 'left' };
       continue;
     }
 
-    const x2 = laneX(b - 1, key);
-    const middle = [];
-    for (let c = a + 1; c < b; c++) middle.push(...columns[c].map(n => boxes.get(n)));
+    const a = columnOf.get(link.from);
+    const b = columnOf.get(link.to);
 
-    const target = (sy + ty) / 2;
-    const tracks = candidateTracks(freeIntervals(middle))
-      .sort((p, q) => Math.abs(p - target) - Math.abs(q - target));
-    const y = tracks.find(t => !conflicts(t, x1, x2, key));
-    const track = y === undefined ? tracks[0] : y;
-    horizontals.push({ y: track, x1, x2, key });
+    if (a === b) {
+      // Обе таблицы в одном столбце — по дорожке справа от столбца.
+      const x = laneX(a, key);
+      routes[i] = { points: [{ x, y: sy }, { x, y: ty }], exit: 'right', entry: 'right' };
+      continue;
+    }
 
-    routes.set(i, [{ x: x1, y: sy }, { x: x1, y: track }, { x: x2, y: track }, { x: x2, y: ty }]);
+    const forward = a < b;
+    const firstGap = forward ? a : a - 1;
+    const lastGap = forward ? b - 1 : b;
+    const x1 = laneX(firstGap, key);
+    const side = { exit: forward ? 'right' : 'left', entry: forward ? 'left' : 'right' };
+
+    if (firstGap === lastGap) {
+      routes[i] = { points: sy === ty ? [] : [{ x: x1, y: sy }, { x: x1, y: ty }], ...side };
+      continue;
+    }
+
+    const x2 = laneX(lastGap, key);
+    const y = corridor(a, b, x1, x2, (sy + ty) / 2, key);
+    routes[i] = { points: [{ x: x1, y: sy }, { x: x1, y }, { x: x2, y }, { x: x2, y: ty }], ...side };
   }
   return routes;
 }
 
-module.exports = { planLanes, gapWidth, routeRelations, isRoutable };
+module.exports = { routeLinks, planLanes, gapWidth, deriveColumns };
 
   };
 
@@ -844,24 +899,26 @@ module.exports = { planLanes, gapWidth, routeRelations, isRoutable };
 // Таблица — swimlane со стек-раскладкой, каждая колонка — отдельная строка-ячейка,
 // связи соединяют строки (PK родителя → FK ребёнка) в нотации «воронья лапка».
 
-const { planLanes, gapWidth, routeRelations } = require('./routing');
+const { planLanes, gapWidth, routeLinks } = require('./routing');
 
 const ROW_HEIGHT = 30;
 const HEADER_HEIGHT = 30;
 const MIN_WIDTH = 180;
-const MAX_WIDTH = 640;
+const MAX_WIDTH = 480; // длиннее — строка переносится
 const CHAR_WIDTH = 6.6;
-const H_GAP = 120; // место под стрелки между столбцами
+const H_GAP = 120; // начальный промежуток между столбцами (до расчёта дорожек)
+const LINE_HEIGHT = 15; // прибавка к высоте строки на каждую перенесённую строку
 const V_GAP = 40;
 const MARGIN = 40;
 
 const TABLE_STYLE =
   'swimlane;fontStyle=1;childLayout=stackLayout;horizontal=1;startSize=' + HEADER_HEIGHT + ';' +
   'horizontalStack=0;resizeParent=1;resizeParentMax=0;resizeLast=0;collapsible=1;' +
-  'marginBottom=0;html=1;';
+  'marginBottom=0;html=1;sqlErTable=1;';
 
+// whiteSpace=wrap — длинные ограничения и индексы переносятся, а не обрезаются.
 const ROW_STYLE =
-  'text;align=left;verticalAlign=middle;spacingLeft=8;spacingRight=8;overflow=hidden;' +
+  'text;align=left;verticalAlign=middle;spacingLeft=8;spacingRight=8;overflow=hidden;whiteSpace=wrap;' +
   'rotatable=0;points=[[0,0.5],[1,0.5]];portConstraint=eastwest;html=1;';
 
 const NOTE_STYLE = ROW_STYLE + 'fontSize=11;textOpacity=60;';
@@ -935,16 +992,31 @@ function buildRows(table, opts) {
     : (table.constraints || []).slice();
   if (opts.showIndexes) notes.push(...(table.indexes || []).map(indexLabel));
   if (notes.length) {
-    rows.push({ column: null, label: '', style: DIVIDER_STYLE, height: DIVIDER_HEIGHT });
-    notes.forEach(label => rows.push({ column: null, label, style: NOTE_STYLE, height: NOTE_HEIGHT }));
+    rows.push({ column: null, label: '', style: DIVIDER_STYLE, height: DIVIDER_HEIGHT, divider: true });
+    notes.forEach(label => rows.push({ column: null, label, style: NOTE_STYLE, height: NOTE_HEIGHT, note: true }));
   }
+  return rows;
+}
 
+// Ширина строки по тексту (жирный текст PK шире примерно на 10%).
+function rowTextWidth(row) {
+  return textWidth(row.label, row.note ? 11 : 12) * (/fontStyle=[13];/.test(row.style) ? 1.1 : 1) + 24;
+}
+
+// Ширина таблицы; строки, которые в неё не влезли, переносятся — считаем их высоту и Y.
+function sizeRows(table, rows) {
+  const widest = Math.max(textWidth(table.name) * 1.1 + 40, ...rows.map(rowTextWidth));
+  const width = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.ceil(widest / 10) * 10));
   let y = HEADER_HEIGHT;
   for (const row of rows) {
+    if (!row.divider) {
+      const lines = Math.max(1, Math.ceil(rowTextWidth(row) / width));
+      row.height += (lines - 1) * (row.note ? LINE_HEIGHT - 2 : LINE_HEIGHT);
+    }
     row.y = y;
     y += row.height;
   }
-  return rows;
+  return { width, height: y };
 }
 
 function textWidth(text, fontSize = 12) {
@@ -1010,12 +1082,7 @@ function layout(model, opts) {
   const boxes = new Map();
   for (const t of tables) {
     const rows = buildRows(t, opts);
-    // Жирный текст (PK) шире обычного примерно на 10%.
-    const rowWidth = r => textWidth(r.label, r.height === NOTE_HEIGHT ? 11 : 12) *
-      (/fontStyle=[13];/.test(r.style) ? 1.1 : 1) + 24;
-    const widest = Math.max(textWidth(t.name) * 1.1 + 40, ...rows.map(rowWidth));
-    const width = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.ceil(widest / 10) * 10));
-    const height = rows.reduce((h, r) => h + r.height, HEADER_HEIGHT);
+    const { width, height } = sizeRows(t, rows);
     boxes.set(t.name, { table: t, rows, width, height, x: 0, y: 0 });
   }
 
@@ -1096,7 +1163,7 @@ function layout(model, opts) {
     const row = box.rows.find(r => r.column === column);
     return box.y + (row ? row.y + row.height / 2 : box.height / 2);
   };
-  const lanes = planLanes(relations, columnOf, rowCenter);
+  const lanes = planLanes(buildLinks(relations, rowCenter), columnOf);
   const columnWidth = best.map(names => Math.max(...names.map(n => boxes.get(n).width)));
 
   x = opts.x + MARGIN;
@@ -1106,7 +1173,30 @@ function layout(model, opts) {
     x += columnWidth[i] + gapWidth(lanes, i);
   });
 
-  return { boxes, columns: best, columnX, columnWidth, columnOf, rowCenter, lanes };
+  return { boxes, rowCenter };
+}
+
+// Линии для связей: основная — по первой паре колонок внешнего ключа;
+// для составного ключа остальные пары — дополнительные (пунктир без значков).
+// from/to — таблицы, key — строка-источник (общий «ствол»), sy/ty — Y строк.
+function buildLinks(relations, rowCenter) {
+  const links = [];
+  relations.forEach(rel => {
+    const pairs = [{ parentColumn: rel.parentColumn, childColumn: rel.childColumn }]
+      .concat(rel.extraColumns || []);
+    pairs.forEach((pair, k) => links.push({
+      rel,
+      primary: k === 0,
+      parentColumn: pair.parentColumn,
+      childColumn: pair.childColumn,
+      from: rel.parent,
+      to: rel.child,
+      key: rel.parent + '\u0000' + pair.parentColumn,
+      sy: rowCenter(rel.parent, pair.parentColumn),
+      ty: rowCenter(rel.child, pair.childColumn)
+    }));
+  });
+  return links;
 }
 
 // ---------------------------------------------------------------------- XML
@@ -1129,27 +1219,40 @@ function vertex(id, parent, value, style, x, y, w, h) {
     `<mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry"/></mxCell>`;
 }
 
-// Значки «вороньей лапки» + дуги-«мостики» там, где линии пересекаются.
-function markers(rel) {
-  const start = rel.optional ? 'ERzeroToOne' : 'ERmandOne';
-  const end = rel.oneToOne ? 'ERzeroToOne' : 'ERmany';
-  return `html=1;startArrow=${start};endArrow=${end};startFill=0;endFill=0;jumpStyle=arc;jumpSize=8;`;
+// Основная линия — значки «вороньей лапки»; дополнительная (часть составного ключа) —
+// тонкий пунктир без значков. Везде — дуги-«мостики» на пересечениях.
+// sqlErLink=1 — метка «наша связь» для команды «Перепроложить связи».
+function linkStyle(link) {
+  const common = 'edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;jumpStyle=arc;jumpSize=8;sqlErLink=1;';
+  if (!link.primary) return common + 'dashed=1;dashPattern=4 3;startArrow=none;endArrow=none;opacity=70;';
+  const start = link.rel.optional ? 'ERzeroToOne' : 'ERmandOne';
+  const end = link.rel.oneToOne ? 'ERzeroToOne' : 'ERmany';
+  return common + `startArrow=${start};endArrow=${end};startFill=0;endFill=0;`;
 }
 
-// Прямоугольная линия по заданным точкам: из правого края строки родителя в левый край строки ребёнка.
-const ROUTED_STYLE = 'edgeStyle=orthogonalEdgeStyle;rounded=0;' +
-  'exitX=1;exitY=0.5;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;';
+// С какой стороны строки выходит и в какую входит линия.
+function sideStyle(route) {
+  const exitX = route.exit === 'right' ? 1 : 0;
+  const entryX = route.entry === 'right' ? 1 : 0;
+  return `exitX=${exitX};exitY=0.5;exitDx=0;exitDy=0;exitPerimeter=0;` +
+    `entryX=${entryX};entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;`;
+}
 
 function pointsXml(points) {
   if (!points.length) return '';
-  return '<Array as="points">' + points.map(p => `<mxPoint x="${Math.round(p.x)}" y="${Math.round(p.y)}"/>`).join('') + '</Array>';
+  // Без округления до целых: центр строки бывает дробным (например, 222.5),
+  // и округлённая точка дала бы косой отрезок в полпикселя.
+  const n = v => Math.round(v * 100) / 100;
+  return '<Array as="points">' + points.map(p => `<mxPoint x="${n(p.x)}" y="${n(p.y)}"/>`).join('') + '</Array>';
 }
 
 function toGraphModelXml(model, options) {
   const opts = Object.assign({}, DEFAULTS, options);
-  const geometry = layout(model, opts);
-  const { boxes } = geometry;
-  const routes = routeRelations(model.relations, geometry);
+  const { boxes, rowCenter } = layout(model, opts);
+
+  const links = buildLinks(model.relations, rowCenter);
+  const obstacles = [...boxes.values()].map(b => ({ id: b.table.name, x: b.x, y: b.y, width: b.width, height: b.height }));
+  const routes = routeLinks(links, obstacles);
 
   const cells = ['<mxCell id="0"/>', '<mxCell id="1" parent="0"/>'];
   const rowIds = new Map(); // "таблица\u0000колонка" → id строки
@@ -1167,38 +1270,20 @@ function toGraphModelXml(model, options) {
     });
   }
 
-  model.relations.forEach((rel, i) => {
-    const source = rowIds.get(rel.parent + '\u0000' + rel.parentColumn) || tableIds.get(rel.parent);
-    const target = rowIds.get(rel.child + '\u0000' + rel.childColumn) || tableIds.get(rel.child);
+  links.forEach((link, i) => {
+    const source = rowIds.get(link.from + '\u0000' + link.parentColumn) || tableIds.get(link.from);
+    const target = rowIds.get(link.to + '\u0000' + link.childColumn) || tableIds.get(link.to);
     if (!source || !target) return;
-
-    let style;
-    let points = '';
-    if (routes.has(i)) {
-      style = ROUTED_STYLE + markers(rel);
-      points = pointsXml(routes.get(i));
-    } else if (rel.parent === rel.child) {
-      // Ссылка на себя — петля слева: справа от PK уходят связи к дочерним таблицам.
-      const box = boxes.get(rel.parent);
-      const px = box.x - 30;
-      style = 'edgeStyle=orthogonalEdgeStyle;rounded=0;exitX=0;exitY=0.5;entryX=0;entryY=0.5;' + markers(rel);
-      points = pointsXml([
-        { x: px, y: geometry.rowCenter(rel.parent, rel.parentColumn) },
-        { x: px, y: geometry.rowCenter(rel.child, rel.childColumn) }
-      ]);
-    } else {
-      // Редкий случай (цикл ссылок): ребёнок не правее родителя — стандартная ER-линия.
-      style = 'edgeStyle=entityRelationEdgeStyle;' + markers(rel);
-    }
-
+    const route = routes[i];
+    const style = linkStyle(link) + sideStyle(route);
     cells.push(`<mxCell id="sqler-e${i}" style="${escapeXml(style)}" edge="1" parent="1" source="${source}" target="${target}">` +
-      `<mxGeometry relative="1" as="geometry">${points}</mxGeometry></mxCell>`);
+      `<mxGeometry relative="1" as="geometry">${pointsXml(route.points)}</mxGeometry></mxCell>`);
   });
 
   return `<mxGraphModel><root>${cells.join('')}</root></mxGraphModel>`;
 }
 
-module.exports = { toGraphModelXml, columnLabel, indexLabel };
+module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle };
 
   };
 
@@ -1210,30 +1295,107 @@ module.exports = { toGraphModelXml, columnLabel, indexLabel };
 // строит таблицы и связи на текущей странице.
 
 const { parseSql } = require('./parser');
-const { toGraphModelXml } = require('./drawio');
+const { toGraphModelXml, sideStyle } = require('./drawio');
+const { routeLinks } = require('./routing');
 
 const ACTION = 'sqlErImport';
+const REROUTE = 'sqlErReroute';
 
 function register(ui) {
   installBridgeResponse();
+  addAction(ui, ACTION, 'Из SQL (ER-диаграмма)...', () => showDialog(ui), 'insert');
+  addAction(ui, REROUTE, 'Перепроложить связи (SQL ER)', () => reroute(ui), 'arrange');
+}
 
-  // Повторная загрузка (обновлённая сборка): меню уже дополнено — только подменяем обработчик.
-  const existing = ui.actions.get && ui.actions.get(ACTION);
+// Добавляет действие и пункт меню. При повторной загрузке плагина (обновлённая сборка)
+// меню уже дополнено — только подменяем обработчик.
+function addAction(ui, name, label, funct, menuName) {
+  const existing = ui.actions.get && ui.actions.get(name);
   if (existing) {
-    existing.funct = () => showDialog(ui);
+    existing.funct = funct;
     return;
   }
-  mxResources.parse(ACTION + '=Из SQL (ER-диаграмма)...');
+  mxResources.parse(name + '=' + label);
+  ui.actions.addAction(name, funct);
 
-  ui.actions.addAction(ACTION, () => showDialog(ui));
-
-  const menu = ui.menus.get('insert');
+  const menu = ui.menus.get(menuName);
   if (menu) {
     const original = menu.funct;
     menu.funct = function (m, parent) {
       original.apply(this, arguments);
-      ui.menus.addMenuItems(m, ['-', ACTION], parent);
+      ui.menus.addMenuItems(m, ['-', name], parent);
     };
+  }
+}
+
+// -------------------------------------------------- «Перепроложить связи»
+//
+// После того как таблицы передвинули, у связей остаются изломы на старых местах.
+// Берём текущие положения таблиц, построенных плагином (sqlErTable=1), и заново
+// прокладываем все их связи (sqlErLink=1) той же трассировкой. Одна операция — один Ctrl+Z.
+
+const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
+
+function reroute(ui) {
+  const graph = ui.editor.graph;
+  const model = graph.getModel();
+  const layer = graph.getDefaultParent();
+
+  const isTable = c => model.isVertex(c) && hasFlag(model.getStyle(c), 'sqlErTable');
+  const tableOf = cell => {
+    let c = cell;
+    while (c && !isTable(c)) c = model.getParent(c);
+    return c;
+  };
+  const geo = c => model.getGeometry(c);
+
+  const tableCells = graph.getChildVertices(layer).filter(isTable);
+  const tables = tableCells.map(c => ({ id: c.id, x: geo(c).x, y: geo(c).y, width: geo(c).width, height: geo(c).height }));
+
+  // Y середины строки (или середины таблицы, если связь к самой таблице).
+  const rowY = (row, table) => {
+    const t = geo(table);
+    if (row === table) return t.y + t.height / 2;
+    const r = geo(row);
+    return t.y + r.y + r.height / 2;
+  };
+
+  const links = [];
+  const edges = [];
+  for (const e of graph.getChildEdges(layer)) {
+    if (!hasFlag(model.getStyle(e), 'sqlErLink')) continue;
+    const s = model.getTerminal(e, true);
+    const t = model.getTerminal(e, false);
+    const ts = tableOf(s);
+    const tt = tableOf(t);
+    if (!ts || !tt || ts.parent !== layer || tt.parent !== layer) continue;
+    links.push({ from: ts.id, to: tt.id, key: s.id, sy: rowY(s, ts), ty: rowY(t, tt) });
+    edges.push(e);
+  }
+
+  if (!links.length) {
+    mxUtils.alert('На странице нет связей, построенных плагином «Из SQL (ER-диаграмма)».');
+    return;
+  }
+
+  const routes = routeLinks(links, tables);
+
+  model.beginUpdate();
+  try {
+    edges.forEach((e, i) => {
+      const route = routes[i];
+      let style = model.getStyle(e);
+      for (const pair of sideStyle(route).split(';').filter(Boolean)) {
+        const [key, value] = pair.split('=');
+        style = mxUtils.setStyle(style, key, value);
+      }
+      model.setStyle(e, style);
+      const g = geo(e).clone();
+      g.points = route.points.map(p => new mxPoint(p.x, p.y));
+      model.setGeometry(e, g);
+    });
+  } finally {
+    model.endUpdate();
   }
 }
 

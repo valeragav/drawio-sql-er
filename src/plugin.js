@@ -5,30 +5,107 @@
 // строит таблицы и связи на текущей странице.
 
 const { parseSql } = require('./parser');
-const { toGraphModelXml } = require('./drawio');
+const { toGraphModelXml, sideStyle } = require('./drawio');
+const { routeLinks } = require('./routing');
 
 const ACTION = 'sqlErImport';
+const REROUTE = 'sqlErReroute';
 
 function register(ui) {
   installBridgeResponse();
+  addAction(ui, ACTION, 'Из SQL (ER-диаграмма)...', () => showDialog(ui), 'insert');
+  addAction(ui, REROUTE, 'Перепроложить связи (SQL ER)', () => reroute(ui), 'arrange');
+}
 
-  // Повторная загрузка (обновлённая сборка): меню уже дополнено — только подменяем обработчик.
-  const existing = ui.actions.get && ui.actions.get(ACTION);
+// Добавляет действие и пункт меню. При повторной загрузке плагина (обновлённая сборка)
+// меню уже дополнено — только подменяем обработчик.
+function addAction(ui, name, label, funct, menuName) {
+  const existing = ui.actions.get && ui.actions.get(name);
   if (existing) {
-    existing.funct = () => showDialog(ui);
+    existing.funct = funct;
     return;
   }
-  mxResources.parse(ACTION + '=Из SQL (ER-диаграмма)...');
+  mxResources.parse(name + '=' + label);
+  ui.actions.addAction(name, funct);
 
-  ui.actions.addAction(ACTION, () => showDialog(ui));
-
-  const menu = ui.menus.get('insert');
+  const menu = ui.menus.get(menuName);
   if (menu) {
     const original = menu.funct;
     menu.funct = function (m, parent) {
       original.apply(this, arguments);
-      ui.menus.addMenuItems(m, ['-', ACTION], parent);
+      ui.menus.addMenuItems(m, ['-', name], parent);
     };
+  }
+}
+
+// -------------------------------------------------- «Перепроложить связи»
+//
+// После того как таблицы передвинули, у связей остаются изломы на старых местах.
+// Берём текущие положения таблиц, построенных плагином (sqlErTable=1), и заново
+// прокладываем все их связи (sqlErLink=1) той же трассировкой. Одна операция — один Ctrl+Z.
+
+const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
+
+function reroute(ui) {
+  const graph = ui.editor.graph;
+  const model = graph.getModel();
+  const layer = graph.getDefaultParent();
+
+  const isTable = c => model.isVertex(c) && hasFlag(model.getStyle(c), 'sqlErTable');
+  const tableOf = cell => {
+    let c = cell;
+    while (c && !isTable(c)) c = model.getParent(c);
+    return c;
+  };
+  const geo = c => model.getGeometry(c);
+
+  const tableCells = graph.getChildVertices(layer).filter(isTable);
+  const tables = tableCells.map(c => ({ id: c.id, x: geo(c).x, y: geo(c).y, width: geo(c).width, height: geo(c).height }));
+
+  // Y середины строки (или середины таблицы, если связь к самой таблице).
+  const rowY = (row, table) => {
+    const t = geo(table);
+    if (row === table) return t.y + t.height / 2;
+    const r = geo(row);
+    return t.y + r.y + r.height / 2;
+  };
+
+  const links = [];
+  const edges = [];
+  for (const e of graph.getChildEdges(layer)) {
+    if (!hasFlag(model.getStyle(e), 'sqlErLink')) continue;
+    const s = model.getTerminal(e, true);
+    const t = model.getTerminal(e, false);
+    const ts = tableOf(s);
+    const tt = tableOf(t);
+    if (!ts || !tt || ts.parent !== layer || tt.parent !== layer) continue;
+    links.push({ from: ts.id, to: tt.id, key: s.id, sy: rowY(s, ts), ty: rowY(t, tt) });
+    edges.push(e);
+  }
+
+  if (!links.length) {
+    mxUtils.alert('На странице нет связей, построенных плагином «Из SQL (ER-диаграмма)».');
+    return;
+  }
+
+  const routes = routeLinks(links, tables);
+
+  model.beginUpdate();
+  try {
+    edges.forEach((e, i) => {
+      const route = routes[i];
+      let style = model.getStyle(e);
+      for (const pair of sideStyle(route).split(';').filter(Boolean)) {
+        const [key, value] = pair.split('=');
+        style = mxUtils.setStyle(style, key, value);
+      }
+      model.setStyle(e, style);
+      const g = geo(e).clone();
+      g.points = route.points.map(p => new mxPoint(p.x, p.y));
+      model.setGeometry(e, g);
+    });
+  } finally {
+    model.endUpdate();
   }
 }
 

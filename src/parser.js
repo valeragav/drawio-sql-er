@@ -631,7 +631,7 @@ function finalize(state) {
       const oneToOne = sameSet(fk.columns, child.primaryKey) ||
         child.uniques.concat(singleUniques, child.uniqueIndexSets).some(u => sameSet(u, fk.columns));
 
-      relations.push({
+      const relation = {
         parent: parent.name,
         parentColumn: refColumns[0],
         child: child.name,
@@ -639,7 +639,14 @@ function finalize(state) {
         // Может ли у дочерней записи не быть родителя (FK допускает NULL).
         optional: childCols.some(c => !c.notNull),
         oneToOne
-      });
+      };
+      // Составной ключ: остальные пары колонок (рисуются пунктиром рядом с основной линией).
+      if (fk.columns.length > 1) {
+        relation.extraColumns = fk.columns.slice(1)
+          .map((childColumn, k) => ({ parentColumn: refColumns[k + 1], childColumn }))
+          .filter(pair => pair.parentColumn);
+      }
+      relations.push(relation);
     }
   }
 

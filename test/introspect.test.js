@@ -39,8 +39,8 @@ test('DDL из каталога: serial, identity, inline-ограничения
   assert.match(sql, /CREATE TABLE public\.users \(\n {4}id serial PRIMARY KEY,\n {4}email text NOT NULL UNIQUE\n\);/);
   assert.match(sql, / {4}id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,/);
   assert.match(sql, / {4}user_id integer NOT NULL REFERENCES users\(id\) ON DELETE CASCADE,/);
-  assert.match(sql, / {4}total numeric\(12,2\) NOT NULL DEFAULT 0 CHECK \(total >= 0::numeric\),/);
-  assert.match(sql, / {4}total_x2 numeric GENERATED ALWAYS AS \(\(total \* \(2\)::numeric\)\) STORED,/);
+  assert.match(sql, / {4}total numeric\(12,2\) NOT NULL DEFAULT 0 CHECK \(total >= 0\),/);
+  assert.match(sql, / {4}total_x2 numeric GENERATED ALWAYS AS \(\(total \* 2\)\) STORED,/);
   assert.match(sql, / {4}CONSTRAINT orders_user_note_key UNIQUE \(user_id, note\)\n\);/);
   assert.match(sql, /CREATE INDEX idx_orders_user ON public\.orders USING btree \(user_id\);/);
 });
@@ -55,4 +55,27 @@ test('DDL из каталога разбирается парсером в те 
   const orders = m.tables.find(t => t.name === 'orders');
   assert.equal(orders.indexes.length, 1);
   assert.equal(orders.columns.find(c => c.name === 'id').autoIncrement, true);
+});
+
+test('упрощение выражений, которые PostgreSQL хранит в нормализованном виде', () => {
+  const { simplifyExpr } = require('../bridge/introspect');
+  const cases = [
+    ["CHECK (status = ANY (ARRAY['draft'::text, 'published'::text, 'archived'::text]))",
+      "CHECK (status IN ('draft', 'published', 'archived'))"],
+    ["CHECK (((status)::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[])))",
+      "CHECK (status IN ('a', 'b'))"],
+    ["CHECK (kind <> ALL (ARRAY['x'::text, 'y'::text]))", "CHECK (kind NOT IN ('x', 'y'))"],
+    ["CHECK ((price >= (0)::numeric))", 'CHECK (price >= 0)'],
+    ['CHECK (total >= 0::numeric)', 'CHECK (total >= 0)'],
+    ["CHECK (((rating >= 1) AND (rating <= 5)))", 'CHECK ((rating >= 1) AND (rating <= 5))'],
+    ["'draft'::text", "'draft'"],
+    ["'it''s'::character varying", "'it''s'"],
+    ["'{}'::jsonb", "'{}'::jsonb"],
+    ["'[]'::text[]", "'[]'::text[]"],
+    ['now()', 'now()'],
+    ["nextval('users_id_seq'::regclass)", "nextval('users_id_seq'::regclass)"],
+    ['CREATE UNIQUE INDEX i ON public.p USING btree (external_id) WHERE (external_id IS NOT NULL)',
+      'CREATE UNIQUE INDEX i ON public.p USING btree (external_id) WHERE (external_id IS NOT NULL)']
+  ];
+  for (const [input, expected] of cases) assert.equal(simplifyExpr(input), expected, input);
 });

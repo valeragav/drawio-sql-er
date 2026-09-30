@@ -4,24 +4,26 @@
 // Таблица — swimlane со стек-раскладкой, каждая колонка — отдельная строка-ячейка,
 // связи соединяют строки (PK родителя → FK ребёнка) в нотации «воронья лапка».
 
-const { planLanes, gapWidth, routeRelations } = require('./routing');
+const { planLanes, gapWidth, routeLinks } = require('./routing');
 
 const ROW_HEIGHT = 30;
 const HEADER_HEIGHT = 30;
 const MIN_WIDTH = 180;
-const MAX_WIDTH = 640;
+const MAX_WIDTH = 480; // длиннее — строка переносится
 const CHAR_WIDTH = 6.6;
-const H_GAP = 120; // место под стрелки между столбцами
+const H_GAP = 120; // начальный промежуток между столбцами (до расчёта дорожек)
+const LINE_HEIGHT = 15; // прибавка к высоте строки на каждую перенесённую строку
 const V_GAP = 40;
 const MARGIN = 40;
 
 const TABLE_STYLE =
   'swimlane;fontStyle=1;childLayout=stackLayout;horizontal=1;startSize=' + HEADER_HEIGHT + ';' +
   'horizontalStack=0;resizeParent=1;resizeParentMax=0;resizeLast=0;collapsible=1;' +
-  'marginBottom=0;html=1;';
+  'marginBottom=0;html=1;sqlErTable=1;';
 
+// whiteSpace=wrap — длинные ограничения и индексы переносятся, а не обрезаются.
 const ROW_STYLE =
-  'text;align=left;verticalAlign=middle;spacingLeft=8;spacingRight=8;overflow=hidden;' +
+  'text;align=left;verticalAlign=middle;spacingLeft=8;spacingRight=8;overflow=hidden;whiteSpace=wrap;' +
   'rotatable=0;points=[[0,0.5],[1,0.5]];portConstraint=eastwest;html=1;';
 
 const NOTE_STYLE = ROW_STYLE + 'fontSize=11;textOpacity=60;';
@@ -95,16 +97,31 @@ function buildRows(table, opts) {
     : (table.constraints || []).slice();
   if (opts.showIndexes) notes.push(...(table.indexes || []).map(indexLabel));
   if (notes.length) {
-    rows.push({ column: null, label: '', style: DIVIDER_STYLE, height: DIVIDER_HEIGHT });
-    notes.forEach(label => rows.push({ column: null, label, style: NOTE_STYLE, height: NOTE_HEIGHT }));
+    rows.push({ column: null, label: '', style: DIVIDER_STYLE, height: DIVIDER_HEIGHT, divider: true });
+    notes.forEach(label => rows.push({ column: null, label, style: NOTE_STYLE, height: NOTE_HEIGHT, note: true }));
   }
+  return rows;
+}
 
+// Ширина строки по тексту (жирный текст PK шире примерно на 10%).
+function rowTextWidth(row) {
+  return textWidth(row.label, row.note ? 11 : 12) * (/fontStyle=[13];/.test(row.style) ? 1.1 : 1) + 24;
+}
+
+// Ширина таблицы; строки, которые в неё не влезли, переносятся — считаем их высоту и Y.
+function sizeRows(table, rows) {
+  const widest = Math.max(textWidth(table.name) * 1.1 + 40, ...rows.map(rowTextWidth));
+  const width = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.ceil(widest / 10) * 10));
   let y = HEADER_HEIGHT;
   for (const row of rows) {
+    if (!row.divider) {
+      const lines = Math.max(1, Math.ceil(rowTextWidth(row) / width));
+      row.height += (lines - 1) * (row.note ? LINE_HEIGHT - 2 : LINE_HEIGHT);
+    }
     row.y = y;
     y += row.height;
   }
-  return rows;
+  return { width, height: y };
 }
 
 function textWidth(text, fontSize = 12) {
@@ -170,12 +187,7 @@ function layout(model, opts) {
   const boxes = new Map();
   for (const t of tables) {
     const rows = buildRows(t, opts);
-    // Жирный текст (PK) шире обычного примерно на 10%.
-    const rowWidth = r => textWidth(r.label, r.height === NOTE_HEIGHT ? 11 : 12) *
-      (/fontStyle=[13];/.test(r.style) ? 1.1 : 1) + 24;
-    const widest = Math.max(textWidth(t.name) * 1.1 + 40, ...rows.map(rowWidth));
-    const width = Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.ceil(widest / 10) * 10));
-    const height = rows.reduce((h, r) => h + r.height, HEADER_HEIGHT);
+    const { width, height } = sizeRows(t, rows);
     boxes.set(t.name, { table: t, rows, width, height, x: 0, y: 0 });
   }
 
@@ -256,7 +268,7 @@ function layout(model, opts) {
     const row = box.rows.find(r => r.column === column);
     return box.y + (row ? row.y + row.height / 2 : box.height / 2);
   };
-  const lanes = planLanes(relations, columnOf, rowCenter);
+  const lanes = planLanes(buildLinks(relations, rowCenter), columnOf);
   const columnWidth = best.map(names => Math.max(...names.map(n => boxes.get(n).width)));
 
   x = opts.x + MARGIN;
@@ -266,7 +278,30 @@ function layout(model, opts) {
     x += columnWidth[i] + gapWidth(lanes, i);
   });
 
-  return { boxes, columns: best, columnX, columnWidth, columnOf, rowCenter, lanes };
+  return { boxes, rowCenter };
+}
+
+// Линии для связей: основная — по первой паре колонок внешнего ключа;
+// для составного ключа остальные пары — дополнительные (пунктир без значков).
+// from/to — таблицы, key — строка-источник (общий «ствол»), sy/ty — Y строк.
+function buildLinks(relations, rowCenter) {
+  const links = [];
+  relations.forEach(rel => {
+    const pairs = [{ parentColumn: rel.parentColumn, childColumn: rel.childColumn }]
+      .concat(rel.extraColumns || []);
+    pairs.forEach((pair, k) => links.push({
+      rel,
+      primary: k === 0,
+      parentColumn: pair.parentColumn,
+      childColumn: pair.childColumn,
+      from: rel.parent,
+      to: rel.child,
+      key: rel.parent + '\u0000' + pair.parentColumn,
+      sy: rowCenter(rel.parent, pair.parentColumn),
+      ty: rowCenter(rel.child, pair.childColumn)
+    }));
+  });
+  return links;
 }
 
 // ---------------------------------------------------------------------- XML
@@ -289,27 +324,40 @@ function vertex(id, parent, value, style, x, y, w, h) {
     `<mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry"/></mxCell>`;
 }
 
-// Значки «вороньей лапки» + дуги-«мостики» там, где линии пересекаются.
-function markers(rel) {
-  const start = rel.optional ? 'ERzeroToOne' : 'ERmandOne';
-  const end = rel.oneToOne ? 'ERzeroToOne' : 'ERmany';
-  return `html=1;startArrow=${start};endArrow=${end};startFill=0;endFill=0;jumpStyle=arc;jumpSize=8;`;
+// Основная линия — значки «вороньей лапки»; дополнительная (часть составного ключа) —
+// тонкий пунктир без значков. Везде — дуги-«мостики» на пересечениях.
+// sqlErLink=1 — метка «наша связь» для команды «Перепроложить связи».
+function linkStyle(link) {
+  const common = 'edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;jumpStyle=arc;jumpSize=8;sqlErLink=1;';
+  if (!link.primary) return common + 'dashed=1;dashPattern=4 3;startArrow=none;endArrow=none;opacity=70;';
+  const start = link.rel.optional ? 'ERzeroToOne' : 'ERmandOne';
+  const end = link.rel.oneToOne ? 'ERzeroToOne' : 'ERmany';
+  return common + `startArrow=${start};endArrow=${end};startFill=0;endFill=0;`;
 }
 
-// Прямоугольная линия по заданным точкам: из правого края строки родителя в левый край строки ребёнка.
-const ROUTED_STYLE = 'edgeStyle=orthogonalEdgeStyle;rounded=0;' +
-  'exitX=1;exitY=0.5;exitDx=0;exitDy=0;exitPerimeter=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;';
+// С какой стороны строки выходит и в какую входит линия.
+function sideStyle(route) {
+  const exitX = route.exit === 'right' ? 1 : 0;
+  const entryX = route.entry === 'right' ? 1 : 0;
+  return `exitX=${exitX};exitY=0.5;exitDx=0;exitDy=0;exitPerimeter=0;` +
+    `entryX=${entryX};entryY=0.5;entryDx=0;entryDy=0;entryPerimeter=0;`;
+}
 
 function pointsXml(points) {
   if (!points.length) return '';
-  return '<Array as="points">' + points.map(p => `<mxPoint x="${Math.round(p.x)}" y="${Math.round(p.y)}"/>`).join('') + '</Array>';
+  // Без округления до целых: центр строки бывает дробным (например, 222.5),
+  // и округлённая точка дала бы косой отрезок в полпикселя.
+  const n = v => Math.round(v * 100) / 100;
+  return '<Array as="points">' + points.map(p => `<mxPoint x="${n(p.x)}" y="${n(p.y)}"/>`).join('') + '</Array>';
 }
 
 function toGraphModelXml(model, options) {
   const opts = Object.assign({}, DEFAULTS, options);
-  const geometry = layout(model, opts);
-  const { boxes } = geometry;
-  const routes = routeRelations(model.relations, geometry);
+  const { boxes, rowCenter } = layout(model, opts);
+
+  const links = buildLinks(model.relations, rowCenter);
+  const obstacles = [...boxes.values()].map(b => ({ id: b.table.name, x: b.x, y: b.y, width: b.width, height: b.height }));
+  const routes = routeLinks(links, obstacles);
 
   const cells = ['<mxCell id="0"/>', '<mxCell id="1" parent="0"/>'];
   const rowIds = new Map(); // "таблица\u0000колонка" → id строки
@@ -327,35 +375,17 @@ function toGraphModelXml(model, options) {
     });
   }
 
-  model.relations.forEach((rel, i) => {
-    const source = rowIds.get(rel.parent + '\u0000' + rel.parentColumn) || tableIds.get(rel.parent);
-    const target = rowIds.get(rel.child + '\u0000' + rel.childColumn) || tableIds.get(rel.child);
+  links.forEach((link, i) => {
+    const source = rowIds.get(link.from + '\u0000' + link.parentColumn) || tableIds.get(link.from);
+    const target = rowIds.get(link.to + '\u0000' + link.childColumn) || tableIds.get(link.to);
     if (!source || !target) return;
-
-    let style;
-    let points = '';
-    if (routes.has(i)) {
-      style = ROUTED_STYLE + markers(rel);
-      points = pointsXml(routes.get(i));
-    } else if (rel.parent === rel.child) {
-      // Ссылка на себя — петля слева: справа от PK уходят связи к дочерним таблицам.
-      const box = boxes.get(rel.parent);
-      const px = box.x - 30;
-      style = 'edgeStyle=orthogonalEdgeStyle;rounded=0;exitX=0;exitY=0.5;entryX=0;entryY=0.5;' + markers(rel);
-      points = pointsXml([
-        { x: px, y: geometry.rowCenter(rel.parent, rel.parentColumn) },
-        { x: px, y: geometry.rowCenter(rel.child, rel.childColumn) }
-      ]);
-    } else {
-      // Редкий случай (цикл ссылок): ребёнок не правее родителя — стандартная ER-линия.
-      style = 'edgeStyle=entityRelationEdgeStyle;' + markers(rel);
-    }
-
+    const route = routes[i];
+    const style = linkStyle(link) + sideStyle(route);
     cells.push(`<mxCell id="sqler-e${i}" style="${escapeXml(style)}" edge="1" parent="1" source="${source}" target="${target}">` +
-      `<mxGeometry relative="1" as="geometry">${points}</mxGeometry></mxCell>`);
+      `<mxGeometry relative="1" as="geometry">${pointsXml(route.points)}</mxGeometry></mxCell>`);
   });
 
   return `<mxGraphModel><root>${cells.join('')}</root></mxGraphModel>`;
 }
 
-module.exports = { toGraphModelXml, columnLabel, indexLabel };
+module.exports = { toGraphModelXml, columnLabel, indexLabel, sideStyle };
