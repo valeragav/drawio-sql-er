@@ -9,7 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const root = path.join(__dirname, '..');
-const modules = ['parser', 'routing', 'placement', 'select', 'groups', 'drawio', 'export', 'page', 'highlight', 'plugin'];
+const modules = ['parser', 'routing', 'placement', 'select', 'groups', 'sqltext', 'diff', 'drawio', 'export', 'page', 'highlight', 'plugin'];
 const entry = 'plugin';
 
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));

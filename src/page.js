@@ -10,6 +10,8 @@ const { routeLinks } = require('./routing');
 const { placeNewTables } = require('./placement');
 const { selectTables } = require('./select');
 const { computeGroups, frameBounds, FRAME_STYLE } = require('./groups');
+const { parseSql } = require('./parser');
+const { exportSql, readDiagram, parseColumnText } = require('./export');
 
 const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
 
@@ -341,4 +343,65 @@ function pageCells(ui) {
   });
 }
 
-module.exports = { reroute, updatePage, refreshFrames, pageCells };
+// Схема, нарисованная на странице, — модель parser.js (для сравнения со схемой из базы/файла).
+// Таблицы, ENUM, ключи, индексы — через экспорт в SQL; представления — прямо с диаграммы
+// (текст их запроса не хранится, в экспорте от них остаётся только комментарий).
+function diagramModel(ui) {
+  const cells = pageCells(ui);
+  const model = parseSql(exportSql(cells).sql);
+  for (const node of readDiagram(cells).nodes) {
+    if (node.removed || (node.kind !== 'view' && node.kind !== 'materialized view')) continue;
+    model.tables.push({
+      name: node.name,
+      kind: node.kind,
+      columns: node.rows.filter(r => !/^line;/.test(r.style) && !/textOpacity=60/.test(r.style)).map(r => ({ name: r.text }))
+    });
+  }
+  return model;
+}
+
+// Временная подсветка различий (как подсветка связей: поверх диаграммы, без изменений):
+// красным — таблицы и колонки, расходящиеся со схемой; зелёным — таблицы, которых в схеме нет.
+// Возвращает функцию, снимающую подсветку.
+const DIFF_RED = '#e53935';
+const DIFF_GREEN = '#43a047';
+
+function markDiff(ui, diff) {
+  const graph = ui.editor.graph;
+  const layer = graph.getDefaultParent();
+  const { model, isTable } = helpers(graph);
+  const div = document.createElement('div');
+  const text = c => {
+    div.innerHTML = graph.convertValueToString(c) || '';
+    return div.textContent.trim();
+  };
+  const title = c => text(c).replace(/\s+\((view|materialized view)\)$/, '').replace(/^«enum»\s*/, '');
+  const nodes = new Map(graph.getChildVertices(layer).filter(isTable).map(c => [title(c), c]));
+
+  const marks = [];
+  const mark = (cell, color, width) => {
+    const state = graph.view.getState(cell);
+    if (!state) return;
+    const h = new mxCellHighlight(graph, color, width);
+    h.highlight(state);
+    marks.push(h);
+  };
+
+  for (const name of diff.onlyLeft) if (nodes.has(name)) mark(nodes.get(name), DIFF_GREEN, 3);
+  for (const t of diff.changed) {
+    const table = nodes.get(t.name);
+    if (!table) continue;
+    mark(table, DIFF_RED, 2);
+    const columns = new Set(t.changes.map(c => c.column).filter(Boolean));
+    for (const row of model.getChildren(table) || []) {
+      if (model.isVertex(row) && columns.has(parseColumnText(text(row)).name)) mark(row, DIFF_RED, 2);
+    }
+  }
+  for (const item of diff.enums.concat(diff.views)) {
+    const node = nodes.get(item.name);
+    if (node) mark(node, item.side === 'left' ? DIFF_GREEN : DIFF_RED, 2);
+  }
+  return () => marks.forEach(h => h.destroy());
+}
+
+module.exports = { reroute, updatePage, refreshFrames, pageCells, diagramModel, markDiff };

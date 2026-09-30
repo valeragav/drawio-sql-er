@@ -1397,6 +1397,333 @@ module.exports = { computeGroups, frameBounds, FRAME_STYLE, FRAME_TOP, FRAME_BOT
 
   };
 
+  defs["sqltext"] = function (module, exports, require) {
+'use strict';
+
+// Приведение SQL-выражений к привычному виду (общий код для моста к базе и сравнения схем).
+
+// PostgreSQL хранит выражения в нормализованном виде — возвращаем их к тому,
+// как их обычно пишут:
+//   (status)::text = ANY ((ARRAY['a'::character varying, 'b'])::text[])  →  status IN ('a', 'b')
+//   'draft'::text → 'draft',   (0)::numeric → 0,   CHECK ((x > 0)) → CHECK (x > 0)
+const TEXT_TYPES = '(?:text|character varying|varchar|bpchar|character)';
+const NUMERIC_TYPES = '(?:numeric|integer|bigint|smallint|real|double precision)';
+
+function simplifyExpr(expr) {
+  if (!expr) return expr;
+  let s = expr;
+  s = s.replace(new RegExp(`\\(\\(ARRAY\\[([^\\]]*)\\]\\)::${TEXT_TYPES}\\[\\]\\)`, 'g'), '(ARRAY[$1])');
+  s = s.replace(new RegExp(`'((?:[^']|'')*)'::${TEXT_TYPES}(?![\\w\\[])`, 'g'), "'$1'");
+  s = s.replace(new RegExp(`\\(([A-Za-z_][\\w$]*|"(?:[^"]|"")+")\\)::${TEXT_TYPES}(?![\\w\\[])`, 'g'), '$1');
+  s = s.replace(new RegExp(`\\((-?\\d+(?:\\.\\d+)?)\\)::${NUMERIC_TYPES}\\b`, 'g'), '$1');
+  s = s.replace(new RegExp(`(^|[^\\w.'])(\\d+(?:\\.\\d+)?)::${NUMERIC_TYPES}\\b`, 'g'), '$1$2');
+  // «x = ANY (ARRAY[…])» и «x = ANY ((ARRAY[…]))» — скобки учитываем парами.
+  const list = '(?:\\(ARRAY\\[([^\\]]*)\\]\\)|ARRAY\\[([^\\]]*)\\])';
+  const ident = '([A-Za-z_][\\w$.]*|"(?:[^"]|"")+")';
+  s = s.replace(new RegExp(`${ident}\\s*=\\s*ANY\\s*\\(\\s*${list}\\s*\\)`, 'g'),
+    (m, col, a, b) => `${col} IN (${a !== undefined ? a : b})`);
+  s = s.replace(new RegExp(`${ident}\\s*<>\\s*ALL\\s*\\(\\s*${list}\\s*\\)`, 'g'),
+    (m, col, a, b) => `${col} NOT IN (${a !== undefined ? a : b})`);
+  return stripOuterParens(s);
+}
+
+// «CHECK ((a > 0))» → «CHECK (a > 0)»; «((a > 0))» → «(a > 0)».
+function stripOuterParens(s) {
+  const m = /^(CHECK\s*)?\((.*)\)$/s.exec(s);
+  if (!m) return s;
+  let inner = m[2];
+  while (inner.startsWith('(') && inner.endsWith(')') && balanced(inner.slice(1, -1))) inner = inner.slice(1, -1);
+  return (m[1] ? m[1] : '') + '(' + inner + ')';
+}
+
+function balanced(s) {
+  let depth = 0;
+  let quote = false;
+  for (const ch of s) {
+    if (ch === "'") quote = !quote;
+    if (quote) continue;
+    if (ch === '(') depth++;
+    if (ch === ')' && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+module.exports = { simplifyExpr };
+
+  };
+
+  defs["diff"] = function (module, exports, require) {
+'use strict';
+
+// Сравнение двух схем (моделей parser.js): диаграммы на странице и схемы из базы или файла.
+//
+// Сравнивается смысл, а не запись: обе стороны приводятся к одному виду —
+// синонимы типов (INT = integer, TIMESTAMPTZ = timestamp with time zone, SERIAL = integer
+// с автоинкрементом), ограничения без имён и без разницы «у колонки / у таблицы»,
+// выражения через simplifyExpr. Если выражения CHECK всё же различаются по тексту,
+// это «возможно отличается», а не явное различие.
+
+const { simplifyExpr } = require('./sqltext');
+
+// ------------------------------------------------------------- нормализация
+
+const TYPE_SYNONYMS = [
+  [/^(int|int4|integer|serial|serial4)$/, 'integer'],
+  [/^(int8|bigint|bigserial|serial8)$/, 'bigint'],
+  [/^(int2|smallint|smallserial|serial2)$/, 'smallint'],
+  [/^(bool|boolean)$/, 'boolean'],
+  [/^(float8|double precision|float)$/, 'double precision'],
+  [/^(float4|real)$/, 'real'],
+  [/^(timestamptz|timestamp with time zone)$/, 'timestamptz'],
+  [/^(timestamp|timestamp without time zone)$/, 'timestamp'],
+  [/^(timetz|time with time zone)$/, 'timetz'],
+  [/^(time|time without time zone)$/, 'time']
+];
+
+// «VARCHAR(255)» → «varchar(255)», «NUMERIC(10, 2)» → «numeric(10,2)», «public.status[]» → «status[]».
+function normalizeType(type) {
+  let t = String(type || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  let array = '';
+  const arr = /(\[\])+$/.exec(t);
+  if (arr) {
+    array = arr[0];
+    t = t.slice(0, -array.length).trim();
+  }
+  t = t.replace(/^public\./, '').replace(/"/g, '');
+  t = t.replace(/\s*\(\s*/g, '(').replace(/\s*,\s*/g, ',').replace(/\s*\)/g, ')');
+  t = t.replace(/^character varying/, 'varchar').replace(/^(character|bpchar)(?=\(|$)/, 'char')
+    .replace(/^decimal/, 'numeric');
+  const base = t.replace(/\(.*$/, '');
+  const params = t.slice(base.length);
+  for (const [re, canonical] of TYPE_SYNONYMS) {
+    if (re.test(base)) return canonical + params + array;
+  }
+  return t + array;
+}
+
+// Выражение для сравнения: упрощённое, без регистра ключевых слов, пробелов и внешних скобок.
+function normalizeExpr(expr) {
+  if (expr == null) return null;
+  let s = simplifyExpr(String(expr)).trim();
+  s = s.replace(/'(?:[^']|'')*'|[^']+/g, part => (part.startsWith("'") ? part : part.toLowerCase().replace(/\s+/g, '')));
+  while (/^\(.*\)$/.test(s) && balanced(s.slice(1, -1))) s = s.slice(1, -1);
+  return s;
+}
+
+function balanced(s) {
+  let depth = 0;
+  let quote = false;
+  for (const ch of s) {
+    if (ch === "'") quote = !quote;
+    if (quote) continue;
+    if (ch === '(') depth++;
+    if (ch === ')' && --depth < 0) return false;
+  }
+  return depth === 0;
+}
+
+// Все CHECK (…) из текста ограничений (с балансом скобок).
+function checksIn(text) {
+  const out = [];
+  const re = /CHECK\s*\(/gi;
+  let m;
+  while ((m = re.exec(text || ''))) {
+    let depth = 0;
+    let i = m.index + m[0].length - 1;
+    for (; i < text.length; i++) {
+      if (text[i] === '(') depth++;
+      if (text[i] === ')' && --depth === 0) break;
+    }
+    out.push(normalizeExpr(text.slice(m.index + m[0].length, i)));
+    re.lastIndex = i;
+  }
+  return out;
+}
+
+const isNextval = d => d != null && /^nextval\(/i.test(String(d));
+
+// «'new'::status» у колонки типа status — то же, что «'new'»: приведение к своему типу лишнее.
+function withoutOwnCast(expr, type) {
+  if (expr == null) return expr;
+  const m = /^('(?:[^']|'')*')::(.+)$/.exec(String(expr).trim());
+  return m && normalizeType(m[2]) === normalizeType(type) ? m[1] : expr;
+}
+
+// Нормализованная таблица: всё, что сравниваем, в виде простых значений и множеств.
+function normalizeTable(t, relations) {
+  const columns = new Map();
+  for (const c of t.columns) {
+    columns.set(c.name, {
+      name: c.name,
+      type: normalizeType(c.type),
+      notNull: !!(c.notNull || c.primaryKey),
+      autoIncrement: !!c.autoIncrement,
+      default: isNextval(c.default) ? null : normalizeExpr(withoutOwnCast(c.default, c.type)),
+      comment: c.comment || null
+    });
+  }
+  const uniques = new Set(t.columns.filter(c => c.unique && !c.primaryKey).map(c => c.name));
+  for (const u of t.compositeUniques || []) uniques.add([...u].sort().join(','));
+  const checks = new Set([
+    ...t.columns.flatMap(c => checksIn(c.constraints)),
+    ...(t.constraints || []).flatMap(checksIn)
+  ]);
+  const indexes = new Map();
+  for (const ix of t.indexes || []) {
+    const key = [
+      ix.unique ? 'UNIQUE' : '',
+      (ix.method || 'btree').toLowerCase(),
+      ix.columns.map(normalizeExpr).join(','),
+      ix.include && ix.include.length ? 'INCLUDE ' + ix.include.join(',') : '',
+      ix.where ? 'WHERE ' + normalizeExpr(ix.where) : ''
+    ].join('|');
+    indexes.set(key, ix);
+  }
+  const fks = new Set();
+  for (const r of relations.filter(r => r.child === t.name)) {
+    const pairs = [[r.childColumn, r.parentColumn]].concat((r.extraColumns || []).map(p => [p.childColumn, p.parentColumn]));
+    fks.add(pairs.map(([c, p]) => `${c}→${r.parent}.${p}`).join(' + '));
+  }
+  return {
+    name: t.name,
+    comment: t.comment || null,
+    columns,
+    primaryKey: [...(t.primaryKey || [])].sort().join(','),
+    uniques,
+    checks,
+    indexes,
+    fks
+  };
+}
+
+// ------------------------------------------------------------------ сравнение
+
+// left — диаграмма, right — база/файл. Возвращает { same, tables, enums, views, hints, count }.
+// opts.comments — сравнивать ли комментарии.
+function diffSchemas(left, right, opts = {}) {
+  const tablesOf = m => m.tables.filter(t => (t.kind || 'table') === 'table');
+  const L = new Map(tablesOf(left).map(t => [t.name, normalizeTable(t, left.relations)]));
+  const R = new Map(tablesOf(right).map(t => [t.name, normalizeTable(t, right.relations)]));
+
+  const result = { onlyLeft: [], onlyRight: [], changed: [], same: [], enums: [], views: [], hints: [] };
+
+  for (const name of L.keys()) if (!R.has(name)) result.onlyLeft.push(name);
+  for (const name of R.keys()) if (!L.has(name)) result.onlyRight.push(name);
+
+  for (const [name, a] of L) {
+    const b = R.get(name);
+    if (!b) continue;
+    const changes = compareTables(a, b, opts);
+    if (changes.length) result.changed.push({ name, changes });
+    else result.same.push(name);
+  }
+
+  // Возможные переименования: таблица только на диаграмме ~ таблица только в базе.
+  for (const l of result.onlyLeft) {
+    for (const r of result.onlyRight) {
+      const a = [...L.get(l).columns.keys()];
+      const b = new Set(R.get(r).columns.keys());
+      const common = a.filter(c => b.has(c)).length;
+      if (common / Math.max(a.length, b.size) >= 0.7) result.hints.push(`возможно, таблица переименована: ${r} → ${l}`);
+    }
+  }
+
+  // ENUM: набор и порядок значений.
+  const enumMap = m => new Map((m.enums || []).map(e => [e.name, e]));
+  const EL = enumMap(left);
+  const ER = enumMap(right);
+  for (const [name, e] of EL) {
+    if (!ER.has(name)) result.enums.push({ name, text: `ENUM ${name}: только на диаграмме`, side: 'left' });
+    else if (e.values.join('\u0000') !== ER.get(name).values.join('\u0000')) {
+      result.enums.push({ name, text: `ENUM ${name}: значения — на диаграмме (${e.values.join(', ')}), в схеме (${ER.get(name).values.join(', ')})` });
+    }
+  }
+  for (const name of ER.keys()) if (!EL.has(name)) result.enums.push({ name, text: `ENUM ${name}: только в схеме`, side: 'right' });
+
+  // Представления: есть ли и список колонок (текста запроса на диаграмме нет).
+  const viewMap = m => new Map(m.tables.filter(t => t.kind && t.kind !== 'table').map(t => [t.name, t]));
+  const VL = viewMap(left);
+  const VR = viewMap(right);
+  for (const [name, v] of VL) {
+    if (!VR.has(name)) result.views.push({ name, text: `${v.kind} ${name}: только на диаграмме`, side: 'left' });
+    else {
+      const a = v.columns.map(c => c.name).join(', ');
+      const b = VR.get(name).columns.map(c => c.name).join(', ');
+      if (a !== b) result.views.push({ name, text: `${v.kind} ${name}: колонки — на диаграмме (${a}), в схеме (${b})` });
+    }
+  }
+  for (const [name, v] of VR) if (!VL.has(name)) result.views.push({ name, text: `${v.kind} ${name}: только в схеме`, side: 'right' });
+
+  result.count = result.onlyLeft.length + result.onlyRight.length +
+    result.changed.reduce((n, t) => n + t.changes.length, 0) + result.enums.length + result.views.length;
+  return result;
+}
+
+// Различия двух одноимённых таблиц: [{ column?, text, maybe? }].
+function compareTables(a, b, opts) {
+  const changes = [];
+  const add = (text, column, maybe) => changes.push({ text, column: column || null, maybe: !!maybe });
+
+  for (const [name, ca] of a.columns) {
+    const cb = b.columns.get(name);
+    if (!cb) {
+      add(`колонка ${name}: только на диаграмме`, name);
+      continue;
+    }
+    if (ca.type !== cb.type) add(`${name}: тип — на диаграмме ${ca.type}, в схеме ${cb.type}`, name);
+    if (ca.notNull !== cb.notNull) add(`${name}: ${ca.notNull ? 'на диаграмме NOT NULL, в схеме нет' : 'в схеме NOT NULL, на диаграмме нет'}`, name);
+    if (ca.autoIncrement !== cb.autoIncrement) add(`${name}: автоинкремент ${ca.autoIncrement ? 'только на диаграмме' : 'только в схеме'}`, name);
+    if (ca.default !== cb.default) add(`${name}: DEFAULT — на диаграмме ${ca.default ?? 'нет'}, в схеме ${cb.default ?? 'нет'}`, name);
+    if (opts.comments && (ca.comment || null) !== (cb.comment || null)) add(`${name}: комментарий отличается`, name, true);
+  }
+  for (const name of b.columns.keys()) if (!a.columns.has(name)) add(`колонка ${name}: только в схеме`, name);
+
+  if (a.primaryKey !== b.primaryKey) add(`первичный ключ — на диаграмме (${a.primaryKey || 'нет'}), в схеме (${b.primaryKey || 'нет'})`);
+
+  const setDiff = (x, y) => [...x].filter(v => !y.has(v));
+  for (const u of setDiff(a.uniques, b.uniques)) add(`UNIQUE (${u}): только на диаграмме`, u.includes(',') ? null : u);
+  for (const u of setDiff(b.uniques, a.uniques)) add(`UNIQUE (${u}): только в схеме`, u.includes(',') ? null : u);
+  for (const f of setDiff(a.fks, b.fks)) add(`внешний ключ ${f}: только на диаграмме`, f.split('→')[0]);
+  for (const f of setDiff(b.fks, a.fks)) add(`внешний ключ ${f}: только в схеме`, f.split('→')[0]);
+  // CHECK: текст выражений мог разойтись только записью — «возможно отличается».
+  for (const c of setDiff(a.checks, b.checks)) add(`CHECK (${c}): на диаграмме, в схеме такого текста нет`, null, true);
+  for (const c of setDiff(b.checks, a.checks)) add(`CHECK (${c}): в схеме, на диаграмме такого текста нет`, null, true);
+
+  for (const [key, ix] of a.indexes) {
+    if (!b.indexes.has(key)) add(`индекс ${ix.name || '(без имени)'} (${ix.columns.join(', ')}): только на диаграмме`);
+    else if ((ix.name || null) !== (b.indexes.get(key).name || null)) {
+      add(`индекс (${ix.columns.join(', ')}): имя — на диаграмме ${ix.name}, в схеме ${b.indexes.get(key).name}`, null, true);
+    }
+  }
+  for (const [key, ix] of b.indexes) {
+    if (!a.indexes.has(key)) add(`индекс ${ix.name || '(без имени)'} (${ix.columns.join(', ')}): только в схеме`);
+  }
+
+  if (opts.comments && (a.comment || null) !== (b.comment || null)) add('комментарий таблицы отличается', null, true);
+  return changes;
+}
+
+// Отчёт текстом.
+function formatDiff(d, title) {
+  const lines = [title || 'Сравнение: диаграмма ↔ схема'];
+  lines.push(`Совпадает таблиц: ${d.same.length}. Различий: ${d.count}.`, '');
+  if (d.onlyRight.length) lines.push('➕ Только в схеме (нет на диаграмме)', ...d.onlyRight.map(n => '   ' + n), '');
+  if (d.onlyLeft.length) lines.push('➖ Только на диаграмме (нет в схеме)', ...d.onlyLeft.map(n => '   ' + n), '');
+  for (const t of d.changed) {
+    lines.push(`✎ ${t.name}`, ...t.changes.map(c => `   ${c.maybe ? '~ ' : ''}${c.text}`), '');
+  }
+  if (d.enums.length) lines.push('ENUM', ...d.enums.map(e => '   ' + e.text), '');
+  if (d.views.length) lines.push('Представления', ...d.views.map(v => '   ' + v.text), '');
+  if (d.hints.length) lines.push('Подсказки', ...d.hints.map(h => '   ' + h), '');
+  if (!d.count) lines.push('Различий нет — диаграмма совпадает со схемой.');
+  if (d.changed.some(t => t.changes.some(c => c.maybe))) lines.push('~ — возможно отличается (различие в записи выражения или имени).');
+  return lines.join('\n').trim() + '\n';
+}
+
+module.exports = { diffSchemas, formatDiff, normalizeType, normalizeExpr };
+
+  };
+
   defs["drawio"] = function (module, exports, require) {
 'use strict';
 
@@ -2270,6 +2597,8 @@ const { routeLinks } = require('./routing');
 const { placeNewTables } = require('./placement');
 const { selectTables } = require('./select');
 const { computeGroups, frameBounds, FRAME_STYLE } = require('./groups');
+const { parseSql } = require('./parser');
+const { exportSql, readDiagram, parseColumnText } = require('./export');
 
 const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
 
@@ -2601,7 +2930,68 @@ function pageCells(ui) {
   });
 }
 
-module.exports = { reroute, updatePage, refreshFrames, pageCells };
+// Схема, нарисованная на странице, — модель parser.js (для сравнения со схемой из базы/файла).
+// Таблицы, ENUM, ключи, индексы — через экспорт в SQL; представления — прямо с диаграммы
+// (текст их запроса не хранится, в экспорте от них остаётся только комментарий).
+function diagramModel(ui) {
+  const cells = pageCells(ui);
+  const model = parseSql(exportSql(cells).sql);
+  for (const node of readDiagram(cells).nodes) {
+    if (node.removed || (node.kind !== 'view' && node.kind !== 'materialized view')) continue;
+    model.tables.push({
+      name: node.name,
+      kind: node.kind,
+      columns: node.rows.filter(r => !/^line;/.test(r.style) && !/textOpacity=60/.test(r.style)).map(r => ({ name: r.text }))
+    });
+  }
+  return model;
+}
+
+// Временная подсветка различий (как подсветка связей: поверх диаграммы, без изменений):
+// красным — таблицы и колонки, расходящиеся со схемой; зелёным — таблицы, которых в схеме нет.
+// Возвращает функцию, снимающую подсветку.
+const DIFF_RED = '#e53935';
+const DIFF_GREEN = '#43a047';
+
+function markDiff(ui, diff) {
+  const graph = ui.editor.graph;
+  const layer = graph.getDefaultParent();
+  const { model, isTable } = helpers(graph);
+  const div = document.createElement('div');
+  const text = c => {
+    div.innerHTML = graph.convertValueToString(c) || '';
+    return div.textContent.trim();
+  };
+  const title = c => text(c).replace(/\s+\((view|materialized view)\)$/, '').replace(/^«enum»\s*/, '');
+  const nodes = new Map(graph.getChildVertices(layer).filter(isTable).map(c => [title(c), c]));
+
+  const marks = [];
+  const mark = (cell, color, width) => {
+    const state = graph.view.getState(cell);
+    if (!state) return;
+    const h = new mxCellHighlight(graph, color, width);
+    h.highlight(state);
+    marks.push(h);
+  };
+
+  for (const name of diff.onlyLeft) if (nodes.has(name)) mark(nodes.get(name), DIFF_GREEN, 3);
+  for (const t of diff.changed) {
+    const table = nodes.get(t.name);
+    if (!table) continue;
+    mark(table, DIFF_RED, 2);
+    const columns = new Set(t.changes.map(c => c.column).filter(Boolean));
+    for (const row of model.getChildren(table) || []) {
+      if (model.isVertex(row) && columns.has(parseColumnText(text(row)).name)) mark(row, DIFF_RED, 2);
+    }
+  }
+  for (const item of diff.enums.concat(diff.views)) {
+    const node = nodes.get(item.name);
+    if (node) mark(node, item.side === 'left' ? DIFF_GREEN : DIFF_RED, 2);
+  }
+  return () => marks.forEach(h => h.destroy());
+}
+
+module.exports = { reroute, updatePage, refreshFrames, pageCells, diagramModel, markDiff };
 
   };
 
@@ -2709,7 +3099,8 @@ module.exports = { installHighlight };
 
 const { parseSql } = require('./parser');
 const { toGraphModelXml } = require('./drawio');
-const { reroute, updatePage, pageCells } = require('./page');
+const { reroute, updatePage, pageCells, diagramModel, markDiff } = require('./page');
+const { diffSchemas, formatDiff } = require('./diff');
 const { exportSql } = require('./export');
 const { selectTables, withRelated } = require('./select');
 const { installHighlight } = require('./highlight');
@@ -3146,13 +3537,105 @@ function showDialog(ui) {
   updateBtn.className = 'geBtn';
   updateBtn.title = 'Привести уже вставленную диаграмму к этой схеме, не двигая таблицы (одна операция, Ctrl+Z)';
 
+  // Сравнить схему из поля (база / файл / вставка) с тем, что нарисовано на странице.
+  const compareBtn = mxUtils.button('Сравнить с диаграммой', () => {
+    const model = parsed();
+    if (!model) return;
+    const source = currentMode === 'db' ? `база ${safeTarget(urlInput.value)}`
+      : currentMode === 'file' ? `файл ${fileName.textContent}` : 'SQL из поля';
+    showDiffDialog(ui, model, source, () => updateBtn.click());
+  });
+  compareBtn.className = 'geBtn';
+  compareBtn.title = 'Показать, чем диаграмма на странице отличается от этой схемы';
+
   buttons.appendChild(cancelBtn);
+  buttons.appendChild(compareBtn);
   buttons.appendChild(updateBtn);
   buttons.appendChild(insertBtn);
   div.appendChild(buttons);
 
   ui.showDialog(div, 900, 560, true, true);
   (radios.db.checked ? urlInput : textarea).focus();
+}
+
+// ----------------------------------------------------- сравнение со схемой
+//
+// Отчёт о различиях диаграммы на странице и схемы (из базы, файла или поля) +
+// временная подсветка различий на диаграмме (снимается при закрытии отчёта).
+
+// «postgres://user:pass@host:5433/db» → «host:5433/db» (без пароля — для заголовка отчёта).
+function safeTarget(url) {
+  try {
+    const u = new URL(url);
+    return `${u.hostname}:${u.port || 5432}${u.pathname}`;
+  } catch (e) {
+    return '';
+  }
+}
+
+function showDiffDialog(ui, schema, source, updateFromSchema) {
+  const diagram = diagramModel(ui);
+  if (!diagram.tables.length && !(diagram.enums || []).length) {
+    mxUtils.alert('На странице нет таблиц, вставленных плагином, — сравнивать не с чем.');
+    return;
+  }
+
+  const div = el('div', 'display:flex;flex-direction:column;height:100%;box-sizing:border-box;gap:8px;');
+  const textarea = document.createElement('textarea');
+  textarea.readOnly = true;
+  textarea.setAttribute('wrap', 'off');
+  textarea.style.cssText = 'flex:1;min-height:0;width:100%;box-sizing:border-box;resize:none;' +
+    'font-family:Consolas,Menlo,monospace;font-size:12px;padding:6px;';
+
+  const legend = el('div', 'font-size:12px;opacity:0.8;',
+    'На диаграмме: красным — таблицы и колонки, которые отличаются от схемы; зелёным — таблицы, которых в схеме нет.');
+  const options = el('div', 'display:flex;gap:16px;align-items:center;');
+  const commentsBox = checkbox(options, 'Учитывать комментарии', false);
+
+  let clearMarks = () => {};
+  let report = '';
+  const run = () => {
+    clearMarks();
+    const d = diffSchemas(diagram, schema, { comments: commentsBox.checked });
+    report = formatDiff(d, `Сравнение: диаграмма «${ui.currentPage ? ui.currentPage.getName() : ''}» ↔ ${source}`);
+    textarea.value = report;
+    clearMarks = markDiff(ui, d);
+  };
+  commentsBox.addEventListener('change', run);
+
+  div.appendChild(textarea);
+  div.appendChild(legend);
+  div.appendChild(options);
+
+  const close = () => {
+    clearMarks();
+    ui.hideDialog();
+  };
+  const buttons = el('div', 'display:flex;justify-content:flex-end;gap:8px;');
+  const copyBtn = mxUtils.button('Копировать отчёт', () => {
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(report);
+    else {
+      textarea.select();
+      document.execCommand('copy');
+    }
+  });
+  copyBtn.className = 'geBtn';
+  const updateBtn = mxUtils.button('Обновить диаграмму из схемы', () => {
+    close();
+    updateFromSchema();
+  });
+  updateBtn.className = 'geBtn';
+  updateBtn.title = 'То же, что «Обновить на странице»: таблицы остаются на местах, содержимое — по схеме';
+  const closeBtn = mxUtils.button(mxResources.get('close') || 'Закрыть', close);
+  closeBtn.className = 'geBtn gePrimaryBtn';
+  buttons.appendChild(copyBtn);
+  buttons.appendChild(updateBtn);
+  buttons.appendChild(closeBtn);
+  div.appendChild(buttons);
+
+  // Закрытие крестиком/Esc — тоже снимает подсветку.
+  ui.showDialog(div, 760, 520, true, true, () => clearMarks());
+  run();
 }
 
 // ------------------------------------------------------------ экспорт в SQL
@@ -3385,6 +3868,6 @@ if (typeof Draw !== 'undefined' && Draw.loadPlugin) {
 
   };
 
-  if (typeof window !== 'undefined') window.__sqlErBuild = "e79b1d27c3a4";
+  if (typeof window !== 'undefined') window.__sqlErBuild = "41ea3e0d6647";
   require("plugin");
 })();

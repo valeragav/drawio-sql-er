@@ -7,7 +7,8 @@
 
 const { parseSql } = require('./parser');
 const { toGraphModelXml } = require('./drawio');
-const { reroute, updatePage, pageCells } = require('./page');
+const { reroute, updatePage, pageCells, diagramModel, markDiff } = require('./page');
+const { diffSchemas, formatDiff } = require('./diff');
 const { exportSql } = require('./export');
 const { selectTables, withRelated } = require('./select');
 const { installHighlight } = require('./highlight');
@@ -444,13 +445,105 @@ function showDialog(ui) {
   updateBtn.className = 'geBtn';
   updateBtn.title = 'Привести уже вставленную диаграмму к этой схеме, не двигая таблицы (одна операция, Ctrl+Z)';
 
+  // Сравнить схему из поля (база / файл / вставка) с тем, что нарисовано на странице.
+  const compareBtn = mxUtils.button('Сравнить с диаграммой', () => {
+    const model = parsed();
+    if (!model) return;
+    const source = currentMode === 'db' ? `база ${safeTarget(urlInput.value)}`
+      : currentMode === 'file' ? `файл ${fileName.textContent}` : 'SQL из поля';
+    showDiffDialog(ui, model, source, () => updateBtn.click());
+  });
+  compareBtn.className = 'geBtn';
+  compareBtn.title = 'Показать, чем диаграмма на странице отличается от этой схемы';
+
   buttons.appendChild(cancelBtn);
+  buttons.appendChild(compareBtn);
   buttons.appendChild(updateBtn);
   buttons.appendChild(insertBtn);
   div.appendChild(buttons);
 
   ui.showDialog(div, 900, 560, true, true);
   (radios.db.checked ? urlInput : textarea).focus();
+}
+
+// ----------------------------------------------------- сравнение со схемой
+//
+// Отчёт о различиях диаграммы на странице и схемы (из базы, файла или поля) +
+// временная подсветка различий на диаграмме (снимается при закрытии отчёта).
+
+// «postgres://user:pass@host:5433/db» → «host:5433/db» (без пароля — для заголовка отчёта).
+function safeTarget(url) {
+  try {
+    const u = new URL(url);
+    return `${u.hostname}:${u.port || 5432}${u.pathname}`;
+  } catch (e) {
+    return '';
+  }
+}
+
+function showDiffDialog(ui, schema, source, updateFromSchema) {
+  const diagram = diagramModel(ui);
+  if (!diagram.tables.length && !(diagram.enums || []).length) {
+    mxUtils.alert('На странице нет таблиц, вставленных плагином, — сравнивать не с чем.');
+    return;
+  }
+
+  const div = el('div', 'display:flex;flex-direction:column;height:100%;box-sizing:border-box;gap:8px;');
+  const textarea = document.createElement('textarea');
+  textarea.readOnly = true;
+  textarea.setAttribute('wrap', 'off');
+  textarea.style.cssText = 'flex:1;min-height:0;width:100%;box-sizing:border-box;resize:none;' +
+    'font-family:Consolas,Menlo,monospace;font-size:12px;padding:6px;';
+
+  const legend = el('div', 'font-size:12px;opacity:0.8;',
+    'На диаграмме: красным — таблицы и колонки, которые отличаются от схемы; зелёным — таблицы, которых в схеме нет.');
+  const options = el('div', 'display:flex;gap:16px;align-items:center;');
+  const commentsBox = checkbox(options, 'Учитывать комментарии', false);
+
+  let clearMarks = () => {};
+  let report = '';
+  const run = () => {
+    clearMarks();
+    const d = diffSchemas(diagram, schema, { comments: commentsBox.checked });
+    report = formatDiff(d, `Сравнение: диаграмма «${ui.currentPage ? ui.currentPage.getName() : ''}» ↔ ${source}`);
+    textarea.value = report;
+    clearMarks = markDiff(ui, d);
+  };
+  commentsBox.addEventListener('change', run);
+
+  div.appendChild(textarea);
+  div.appendChild(legend);
+  div.appendChild(options);
+
+  const close = () => {
+    clearMarks();
+    ui.hideDialog();
+  };
+  const buttons = el('div', 'display:flex;justify-content:flex-end;gap:8px;');
+  const copyBtn = mxUtils.button('Копировать отчёт', () => {
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(report);
+    else {
+      textarea.select();
+      document.execCommand('copy');
+    }
+  });
+  copyBtn.className = 'geBtn';
+  const updateBtn = mxUtils.button('Обновить диаграмму из схемы', () => {
+    close();
+    updateFromSchema();
+  });
+  updateBtn.className = 'geBtn';
+  updateBtn.title = 'То же, что «Обновить на странице»: таблицы остаются на местах, содержимое — по схеме';
+  const closeBtn = mxUtils.button(mxResources.get('close') || 'Закрыть', close);
+  closeBtn.className = 'geBtn gePrimaryBtn';
+  buttons.appendChild(copyBtn);
+  buttons.appendChild(updateBtn);
+  buttons.appendChild(closeBtn);
+  div.appendChild(buttons);
+
+  // Закрытие крестиком/Esc — тоже снимает подсветку.
+  ui.showDialog(div, 760, 520, true, true, () => clearMarks());
+  run();
 }
 
 // ------------------------------------------------------------ экспорт в SQL
