@@ -1,16 +1,17 @@
 {
   "name": "drawio-sql-er",
-  "version": "0.1.0",
-  "description": "draw.io plugin: PostgreSQL DDL → ER diagram",
+  "version": "1.0.0",
+  "description": "draw.io plugin: SQL DDL (PostgreSQL, MySQL, SQLite) → ER diagram",
   "private": true,
   "license": "MIT",
   "scripts": {
     "build": "node scripts/build.js",
     "start": "node scripts/build.js && node scripts/start-drawio.js",
-    "test": "node --test"
+    "test": "node --test",
+    "check": "node scripts/check.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "dependencies": {
     "pg": "^8.23.0"

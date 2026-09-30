@@ -1,4 +1,4 @@
-/*! drawio-sql-er 0.1.0 — draw.io plugin: PostgreSQL DDL → ER diagram */
+/*! drawio-sql-er 1.0.0 — draw.io plugin: SQL DDL (PostgreSQL, MySQL, SQLite) → ER diagram */
 (function () {
   var defs = {}, cache = {};
   function require(name) {
@@ -3326,6 +3326,13 @@ const { exportSql, readDiagram, parseColumnText } = require('./export');
 
 const hasFlag = (style, flag) => new RegExp('(^|;)' + flag + '=1(;|$)').test(style || '');
 
+// Текст HTML-подписи. DOMParser разбирает разметку в отдельный документ без выполнения
+// скриптов и обработчиков (onerror у <img> и т.п.) — подписи в чужом .drawio безопасны;
+// innerHTML у элемента текущей страницы такое выполнил бы.
+function htmlToText(html) {
+  return new DOMParser().parseFromString(String(html || ''), 'text/html').body.textContent || '';
+}
+
 function styleValue(style, key) {
   const m = new RegExp('(?:^|;)' + key + '=([^;]*)').exec(style || '');
   return m ? m[1] : null;
@@ -3634,12 +3641,9 @@ function pageCells(ui) {
   const graph = ui.editor.graph;
   const model = graph.getModel();
   const layer = graph.getDefaultParent();
-  const div = document.createElement('div');
   const text = c => {
     const value = graph.convertValueToString(c) || '';
-    if (!graph.isHtmlLabel(c)) return value;
-    div.innerHTML = value;
-    return div.textContent;
+    return graph.isHtmlLabel(c) ? htmlToText(value) : value;
   };
   return model.getDescendants(layer).filter(c => c !== layer).map(c => {
     const g = model.getGeometry(c);
@@ -3688,11 +3692,7 @@ function markDiff(ui, diff) {
   const graph = ui.editor.graph;
   const layer = graph.getDefaultParent();
   const { model, isTable } = helpers(graph);
-  const div = document.createElement('div');
-  const text = c => {
-    div.innerHTML = graph.convertValueToString(c) || '';
-    return div.textContent.trim();
-  };
+  const text = c => htmlToText(graph.convertValueToString(c)).trim();
   const title = c => text(c).replace(/\s+\((view|materialized view)\)$/, '').replace(/^«enum»\s*/, '');
   const nodes = new Map(graph.getChildVertices(layer).filter(isTable).map(c => [title(c), c]));
 
@@ -3727,7 +3727,7 @@ function markDiff(ui, diff) {
   return () => marks.forEach(h => h.destroy());
 }
 
-module.exports = { reroute, updatePage, refreshFrames, pageCells, diagramModel, markDiff };
+module.exports = { htmlToText, reroute, updatePage, refreshFrames, pageCells, diagramModel, markDiff };
 
   };
 
@@ -4726,6 +4726,6 @@ if (typeof Draw !== 'undefined' && Draw.loadPlugin) {
 
   };
 
-  if (typeof window !== 'undefined') window.__sqlErBuild = "5964255dd02a";
+  if (typeof window !== 'undefined') window.__sqlErBuild = "79c4d806b351";
   require("plugin");
 })();
